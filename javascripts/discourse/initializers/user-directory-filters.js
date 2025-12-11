@@ -58,9 +58,16 @@ function fetchUserMeta() {
     return userMetaPromise;
   }
 
-  userMetaPromise = ajax("/user-search.json")
-    .then((result) => {
+  // Important: first load options, then users
+  userMetaPromise = Promise.all([fetchOptions(), ajax("/user-search.json")])
+    .then(([opt, result]) => {
       const map = Object.create(null);
+
+      const genderOptions = opt.gender || [];
+      const countryOptions = opt.country || [];
+      const listenOptions = opt.listen || [];
+      const shareOptions = opt.share || [];
+
       const users = (result && result.users) || [];
 
       users.forEach((u) => {
@@ -71,13 +78,50 @@ function fetchUserMeta() {
         const userFields = u.user_fields || {};
         const key = u.username.toLowerCase();
 
+        let gender = "";
+        let country = "";
+        let listen = "";
+        let share = "";
+        let favorite = "";
+
+        // Looking at values, not ID.
+        Object.values(userFields).forEach((rawValue) => {
+          // Value can be string or array
+          const values = Array.isArray(rawValue) ? rawValue : [rawValue];
+
+          values.forEach((value) => {
+            if (!value) {
+              return;
+            }
+
+            if (!gender && genderOptions.includes(value)) {
+              gender = value;
+            }
+
+            if (!country && countryOptions.includes(value)) {
+              country = value;
+            }
+
+            if (!listen && listenOptions.includes(value)) {
+              listen = value;
+            }
+
+            if (!share && shareOptions.includes(value)) {
+              share = value;
+            }
+          });
+        });
+
+        // favorite empty, currently not used
+        favorite = "";
+
         map[key] = {
           username: u.username,
-          gender: userFields["1"] || "",
-          country: userFields["3"] || "",
-          listen: userFields["5"] || "",
-          share: userFields["6"] || "",
-          favorite: userFields["7"] || "",
+          gender,
+          country,
+          listen,
+          share,
+          favorite,
         };
       });
 
@@ -155,6 +199,7 @@ function ensurePrepared() {
     return preparePromise;
   }
 
+  // fetchUserMeta roept zelf fetchOptions aan, dus dit is voldoende
   preparePromise = Promise.all([ensureAllUsersLoaded(30), fetchUserMeta()]).then(
     (results) => {
       const meta = results[1] || Object.create(null);
@@ -259,7 +304,7 @@ function applyFilters(form, userMeta) {
     }
   });
 
- // Empty message (no users found)
+  // Empty message (no users found)
   let emptyEl = directoryRoot.querySelector(".hb-user-search-empty");
   if (!emptyEl) {
     emptyEl = document.createElement("div");
@@ -287,7 +332,7 @@ export default apiInitializer("0.11.1", (api) => {
       return;
     }
 
-// This is the block that contains "2 users • filter by username • icons"
+    // This is the block that contains "2 users • filter by username • icons"
     const controls =
       directoryRoot.querySelector(".directory-controls") ||
       directoryRoot.querySelector(".users-directory-controls");
