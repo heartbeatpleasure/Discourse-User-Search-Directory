@@ -4,15 +4,19 @@ import { ajax } from "discourse/lib/ajax";
 let optionsCache = null;
 let optionsPromise = null;
 
-// Directory load state
+// Directory load state (used to show ALL matches after filtering)
 let directoryFullyLoaded = false;
 let directoryLoadPromise = null;
 
 // Active filter state (used by MutationObserver)
 let activeForm = null;
 let activeMatchSet = null; // Set(lowercase usernames) OR null when no filters
+
 let directoryObserver = null;
 let scheduledReapply = null;
+
+// Prevent observer feedback loop while we reorder DOM
+let isReordering = false;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -23,13 +27,8 @@ function sleep(ms) {
 // ----------------------
 
 function fetchOptions() {
-  if (optionsCache) {
-    return Promise.resolve(optionsCache);
-  }
-
-  if (optionsPromise) {
-    return optionsPromise;
-  }
+  if (optionsCache) return Promise.resolve(optionsCache);
+  if (optionsPromise) return optionsPromise;
 
   optionsPromise = ajax("/user-search/options.json")
     .then((result) => {
@@ -42,12 +41,7 @@ function fetchOptions() {
       return optionsCache;
     })
     .catch(() => {
-      optionsCache = {
-        gender: [],
-        country: [],
-        listen: [],
-        share: [],
-      };
+      optionsCache = { gender: [], country: [], listen: [], share: [] };
       return optionsCache;
     });
 
@@ -76,9 +70,7 @@ function findDirectoryRoot() {
 
 function findDirectorySection(directoryRoot) {
   const root = directoryRoot || findDirectoryRoot();
-  if (!root) {
-    return null;
-  }
+  if (!root) return null;
 
   return (
     root.querySelector(".user-card-directory") ||
@@ -90,9 +82,7 @@ function findDirectorySection(directoryRoot) {
 
 function findLoadMoreButton(directoryRoot) {
   const root = directoryRoot || findDirectoryRoot();
-  if (!root) {
-    return null;
-  }
+  if (!root) return null;
 
   return (
     root.querySelector(".directory .load-more button, .directory .btn.load-more") ||
@@ -103,6 +93,7 @@ function findLoadMoreButton(directoryRoot) {
 
 // ----------------------
 // Load all users (load more) - robust
+// (used ONLY to show ALL matches after filter submit)
 // ----------------------
 
 async function ensureAllUsersLoaded(maxLoops) {
@@ -126,16 +117,12 @@ async function ensureAllUsersLoaded(maxLoops) {
       lastGrowthAt = Date.now();
     }
 
-    // No usable button: wait for settle and then stop
     if (!btn || btn.disabled || btn.classList.contains("disabled")) {
-      if (Date.now() - lastGrowthAt >= settleMs) {
-        break;
-      }
+      if (Date.now() - lastGrowthAt >= settleMs) break;
       await sleep(pollMs);
       continue;
     }
 
-    // Click and wait for growth
     const startCount = count;
     btn.click();
     loops += 1;
@@ -155,29 +142,21 @@ async function ensureAllUsersLoaded(maxLoops) {
         break;
       }
 
-      // If the button disappeared, the list may still be rendering; settle logic handles it.
       const btnNow = findLoadMoreButton(rootNow);
-      if (!btnNow) {
-        break;
-      }
+      if (!btnNow) break;
     }
   }
 }
 
 function ensureDirectoryFullyLoadedOnce() {
-  if (directoryFullyLoaded) {
-    return Promise.resolve();
-  }
-  if (directoryLoadPromise) {
-    return directoryLoadPromise;
-  }
+  if (directoryFullyLoaded) return Promise.resolve();
+  if (directoryLoadPromise) return directoryLoadPromise;
 
   directoryLoadPromise = ensureAllUsersLoaded(200)
     .then(() => {
       directoryFullyLoaded = true;
     })
     .catch(() => {
-      // don't hard-fail; just stop trying
       directoryFullyLoaded = true;
     });
 
@@ -189,15 +168,11 @@ function ensureDirectoryFullyLoadedOnce() {
 // ----------------------
 
 function extractUsernameFromCard(card) {
-  if (!card) {
-    return null;
-  }
+  if (!card) return null;
 
   const dataUsername =
     (card.dataset && card.dataset.username) || card.getAttribute("data-username");
-  if (dataUsername) {
-    return dataUsername;
-  }
+  if (dataUsername) return dataUsername;
 
   const link =
     card.querySelector(".user-card-name a") ||
@@ -208,9 +183,7 @@ function extractUsernameFromCard(card) {
 
   if (link) {
     const dataUserCard = link.getAttribute("data-user-card");
-    if (dataUserCard) {
-      return dataUserCard;
-    }
+    if (dataUserCard) return dataUserCard;
 
     const href = link.getAttribute("href") || "";
     const match =
@@ -224,9 +197,7 @@ function extractUsernameFromCard(card) {
     }
 
     const text = (link.textContent || "").trim();
-    if (text) {
-      return text.replace(/^@/, "");
-    }
+    if (text) return text.replace(/^@/, "");
   }
 
   const textEl = card.querySelector(
@@ -234,16 +205,14 @@ function extractUsernameFromCard(card) {
   );
   if (textEl) {
     const t = (textEl.textContent || "").trim();
-    if (t) {
-      return t.replace(/^@/, "");
-    }
+    if (t) return t.replace(/^@/, "");
   }
 
   return null;
 }
 
 // ----------------------
-// Fetch matching usernames from plugin (server-side truth)
+// Filters: server-side truth (AND)
 // ----------------------
 
 function buildFiltersFromForm(form) {
@@ -254,15 +223,12 @@ function buildFiltersFromForm(form) {
   const share = (fd.get("share") || "").toString().trim();
 
   const hasAnyFilter = !!(gender || country || listen || share);
-
   return { gender, country, listen, share, hasAnyFilter };
 }
 
 async function fetchMatchingUsernames(filters) {
-  // If no filters -> null means "show all"
-  if (!filters || !filters.hasAnyFilter) {
-    return null;
-  }
+  // AND-filters are applied in the plugin endpoint itself by passing multiple params.
+  if (!filters || !filters.hasAnyFilter) return null;
 
   const perPage = 100;
   let page = 1;
@@ -272,9 +238,7 @@ async function fetchMatchingUsernames(filters) {
 
   while (true) {
     safety += 1;
-    if (safety > 300) {
-      break;
-    }
+    if (safety > 300) break;
 
     const params = new URLSearchParams();
     params.set("page", String(page));
@@ -296,15 +260,10 @@ async function fetchMatchingUsernames(filters) {
 
     const users = (result && result.users) || [];
     users.forEach((u) => {
-      if (u && u.username) {
-        set.add(u.username.toLowerCase());
-      }
+      if (u && u.username) set.add(u.username.toLowerCase());
     });
 
-    if (users.length < perPage) {
-      break;
-    }
-
+    if (users.length < perPage) break;
     page += 1;
   }
 
@@ -312,7 +271,7 @@ async function fetchMatchingUsernames(filters) {
 }
 
 // ----------------------
-// Apply filters (by allowed username set)
+// Apply filter: show/hide by allowed username set
 // ----------------------
 
 function applyFiltersBySet(form, allowedSetOrNull) {
@@ -336,13 +295,13 @@ function applyFiltersBySet(form, allowedSetOrNull) {
       return;
     }
 
-    // filters active:
     if (!username) {
       card.style.display = "none";
       return;
     }
 
-    const allowed = allowedSetOrNull && allowedSetOrNull.has(username.toLowerCase());
+    const allowed =
+      allowedSetOrNull && allowedSetOrNull.has(username.toLowerCase());
     if (allowed) {
       card.style.display = "";
       visibleCount += 1;
@@ -369,26 +328,136 @@ function applyFiltersBySet(form, allowedSetOrNull) {
 }
 
 // ----------------------
-// MutationObserver to keep filters applied while Ember updates DOM
+// Sorting: by LAST SEEN on the card itself
+// - Most recent first
+// - No "Seen ..." => bottom
+// ----------------------
+
+function extractSeenTimestampFromCard(card) {
+  if (!card) return null;
+
+  // 1) Prefer a real timestamp if present (Discourse often uses data-time / datetime)
+  // Try to find an element whose surrounding text contains "Seen"
+  const timeCandidates = Array.from(card.querySelectorAll("[data-time], time[datetime]"));
+
+  for (const el of timeCandidates) {
+    const parentText = (el.parentElement ? el.parentElement.textContent : el.textContent) || "";
+    if (/seen/i.test(parentText)) {
+      // data-time is often ms since epoch in Discourse
+      const dt = el.getAttribute("data-time");
+      if (dt && /^\d+$/.test(dt)) {
+        const n = Number(dt);
+        if (Number.isFinite(n) && n > 0) return n;
+      }
+
+      const datetime = el.getAttribute("datetime");
+      if (datetime) {
+        const ts = Date.parse(datetime);
+        if (Number.isFinite(ts)) return ts;
+      }
+    }
+  }
+
+  // 2) Fallback: parse from visible text e.g. "Seen just now", "Seen 7 mins ago"
+  const text = (card.textContent || "").replace(/\s+/g, " ");
+  const seenMatch = text.match(/Seen\s+(just now|\d+\s+\w+\s+ago)/i);
+  if (!seenMatch) return null;
+
+  const seenPart = seenMatch[1].toLowerCase();
+  const now = Date.now();
+
+  if (seenPart === "just now") return now;
+
+  // Examples:
+  // "1 min ago", "7 mins ago", "2 hours ago", "3 days ago"
+  const m = seenPart.match(/^(\d+)\s+(sec|secs|second|seconds|min|mins|minute|minutes|hour|hours|day|days|week|weeks|month|months|year|years)\s+ago$/i);
+  if (!m) return null;
+
+  const amount = Number(m[1]);
+  if (!Number.isFinite(amount)) return null;
+
+  const unit = m[2].toLowerCase();
+
+  let deltaMs = 0;
+  if (unit.startsWith("sec")) deltaMs = amount * 1000;
+  else if (unit.startsWith("min")) deltaMs = amount * 60 * 1000;
+  else if (unit.startsWith("hour")) deltaMs = amount * 60 * 60 * 1000;
+  else if (unit.startsWith("day")) deltaMs = amount * 24 * 60 * 60 * 1000;
+  else if (unit.startsWith("week")) deltaMs = amount * 7 * 24 * 60 * 60 * 1000;
+  else if (unit.startsWith("month")) deltaMs = amount * 30 * 24 * 60 * 60 * 1000;
+  else if (unit.startsWith("year")) deltaMs = amount * 365 * 24 * 60 * 60 * 1000;
+
+  return now - deltaMs;
+}
+
+function sortCardsByLastSeen() {
+  const directoryRoot = findDirectoryRoot();
+  if (!directoryRoot) return;
+
+  const directorySection = findDirectorySection(directoryRoot);
+  if (!directorySection) return;
+
+  const children = Array.from(directorySection.children || []);
+  if (children.length <= 1) return;
+
+  const decorated = children.map((node, idx) => {
+    const ts = extractSeenTimestampFromCard(node);
+    // null => never seen -> bottom
+    return { node, idx, ts };
+  });
+
+  decorated.sort((a, b) => {
+    const aHas = a.ts !== null && Number.isFinite(a.ts);
+    const bHas = b.ts !== null && Number.isFinite(b.ts);
+
+    // Both missing => keep original order
+    if (!aHas && !bHas) return a.idx - b.idx;
+
+    // Missing goes to bottom
+    if (!aHas && bHas) return 1;
+    if (aHas && !bHas) return -1;
+
+    // Both present => most recent first (DESC)
+    if (b.ts !== a.ts) return b.ts - a.ts;
+
+    // Tie-breaker stable
+    return a.idx - b.idx;
+  });
+
+  isReordering = true;
+  const frag = document.createDocumentFragment();
+  decorated.forEach((d) => frag.appendChild(d.node));
+  directorySection.appendChild(frag);
+  setTimeout(() => {
+    isReordering = false;
+  }, 0);
+}
+
+// ----------------------
+// MutationObserver: keep filter + sorting applied
 // ----------------------
 
 function stopObservingDirectory() {
-  if (directoryObserver) {
-    directoryObserver.disconnect();
-  }
+  if (directoryObserver) directoryObserver.disconnect();
   directoryObserver = null;
 
-  if (scheduledReapply) {
-    clearTimeout(scheduledReapply);
-  }
+  if (scheduledReapply) clearTimeout(scheduledReapply);
   scheduledReapply = null;
 }
 
-function scheduleReapplyFilters() {
+function reapplyAll() {
+  if (!activeForm) return;
+  applyFiltersBySet(activeForm, activeMatchSet);
+  sortCardsByLastSeen();
+}
+
+function scheduleReapply() {
   if (scheduledReapply) return;
 
   scheduledReapply = setTimeout(() => {
     scheduledReapply = null;
+
+    if (isReordering) return;
 
     if (!activeForm) return;
 
@@ -399,20 +468,19 @@ function scheduleReapplyFilters() {
       return;
     }
 
-    applyFiltersBySet(activeForm, activeMatchSet);
-  }, 100);
+    reapplyAll();
+  }, 120);
 }
 
 function startObservingDirectory() {
   stopObservingDirectory();
 
-  if (!activeForm) return;
-
   const root = findDirectoryRoot();
   if (!root) return;
 
   directoryObserver = new MutationObserver(() => {
-    scheduleReapplyFilters();
+    if (isReordering) return;
+    scheduleReapply();
   });
 
   directoryObserver.observe(root, { childList: true, subtree: true });
@@ -436,7 +504,14 @@ export default apiInitializer("0.11.1", (api) => {
     const container = controls.parentElement || directoryRoot;
 
     // Prevent double inject
-    if (container.querySelector(".hb-user-search-filters")) return;
+    if (container.querySelector(".hb-user-search-filters")) {
+      // Still ensure observer + sorting are active
+      if (activeForm) {
+        startObservingDirectory();
+        sortCardsByLastSeen();
+      }
+      return;
+    }
 
     fetchOptions().then((opt) => {
       const listenValues = (opt.listen || []).filter(
@@ -531,6 +606,14 @@ export default apiInitializer("0.11.1", (api) => {
       const form = wrapper.querySelector(".hb-user-search-form");
       const resetButton = wrapper.querySelector(".hb-user-search-reset");
 
+      // Keep state for sorting and observer
+      activeForm = form;
+      activeMatchSet = null;
+
+      // Start observer and apply initial sort
+      startObservingDirectory();
+      setTimeout(() => sortCardsByLastSeen(), 0);
+
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
 
@@ -553,34 +636,35 @@ export default apiInitializer("0.11.1", (api) => {
 
         const filters = buildFiltersFromForm(form);
 
-        // If no filters: show all and stop observing
+        // No filters: show all, keep sorting
         if (!filters.hasAnyFilter) {
           if (loading) loading.style.display = "none";
-          activeForm = null;
+          activeForm = form;
           activeMatchSet = null;
-          stopObservingDirectory();
-          applyFiltersBySet(form, null);
+          reapplyAll();
           return;
         }
 
-        // Load all users in the directory first (your "all users" requirement)
+        // Load all users so we can show ALL matches
         await ensureDirectoryFullyLoadedOnce();
 
-        // Fetch allowed usernames from server-side plugin filtering
+        // Fetch allowed usernames from server-side plugin filtering (AND)
         const matchSet = await fetchMatchingUsernames(filters);
 
         if (loading) loading.style.display = "none";
 
         activeForm = form;
-        activeMatchSet = matchSet || new Set(); // if fetch failed, show none rather than wrong users
-        startObservingDirectory();
+        // If fetch fails: show none rather than wrong users
+        activeMatchSet = matchSet || new Set();
 
-        applyFiltersBySet(form, activeMatchSet);
+        reapplyAll();
       });
 
       resetButton.addEventListener("click", () => {
-        stopObservingDirectory();
-        activeForm = null;
+        // Reset directory load cache so future searches can re-load
+        directoryFullyLoaded = false;
+        directoryLoadPromise = null;
+
         activeMatchSet = null;
         window.location.reload();
       });
@@ -589,15 +673,19 @@ export default apiInitializer("0.11.1", (api) => {
 
   api.onPageChange((url) => {
     stopObservingDirectory();
-    activeForm = null;
-    activeMatchSet = null;
 
     const cleanUrl = (url || "").split("#")[0];
     const isDirectory =
-      /^\/u\/?(\?.*)?$/.test(cleanUrl) ||
-      /^\/users\/?(\?.*)?$/.test(cleanUrl);
+      /^\/u\/?(\?.*)?$/.test(cleanUrl) || /^\/users\/?(\?.*)?$/.test(cleanUrl);
 
-    if (!isDirectory) return;
+    if (!isDirectory) {
+      activeForm = null;
+      activeMatchSet = null;
+      return;
+    }
+
+    directoryFullyLoaded = false;
+    directoryLoadPromise = null;
 
     setTimeout(injectFilters, 0);
   });
