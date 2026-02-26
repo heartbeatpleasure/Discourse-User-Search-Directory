@@ -1,22 +1,26 @@
 import { apiInitializer } from "discourse/lib/api";
 import { ajax } from "discourse/lib/ajax";
+import getURL from "discourse-common/lib/get-url";
 
 let optionsCache = null;
 let optionsPromise = null;
 
-// Directory load state (used to show ALL matches after filtering)
-let directoryFullyLoaded = false;
-let directoryLoadPromise = null;
+// Search mode state
+let originalSection = null;
+let originalSectionDisplay = "";
+let templateNode = null;
+let resultsSection = null;
 
-// Active filter state (used by MutationObserver)
+let searchActive = false;
+let searchFilters = null;
+let searchPage = 1;
+let searchPerPage = 30;
+let searchHasMore = false;
+let searchLoading = false;
+
+let loadMoreBtn = null;
+let loadMoreCaptureHandler = null;
 let activeForm = null;
-let activeMatchSet = null; // Set(lowercase usernames) OR null when no filters
-
-let directoryObserver = null;
-let scheduledReapply = null;
-
-// Prevent observer feedback loop while we reorder DOM
-let isReordering = false;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -85,134 +89,16 @@ function findLoadMoreButton(directoryRoot) {
   if (!root) return null;
 
   return (
-    root.querySelector(".directory .load-more button, .directory .btn.load-more") ||
+    root.querySelector(
+      ".directory .load-more button, .directory .btn.load-more"
+    ) ||
     root.querySelector(".load-more button") ||
     root.querySelector(".load-more.btn, button.load-more")
   );
 }
 
 // ----------------------
-// Load all users (load more) - robust
-// (used ONLY to show ALL matches after filter submit)
-// ----------------------
-
-async function ensureAllUsersLoaded(maxLoops) {
-  const max = maxLoops || 200;
-  const perClickTimeoutMs = 10000;
-  const pollMs = 200;
-  const settleMs = 800;
-
-  let loops = 0;
-  let lastGrowthAt = Date.now();
-  let lastCount = -1;
-
-  while (loops < max) {
-    const root = findDirectoryRoot();
-    const section = findDirectorySection(root);
-    const btn = findLoadMoreButton(root);
-
-    const count = section && section.children ? section.children.length : 0;
-    if (count !== lastCount) {
-      lastCount = count;
-      lastGrowthAt = Date.now();
-    }
-
-    if (!btn || btn.disabled || btn.classList.contains("disabled")) {
-      if (Date.now() - lastGrowthAt >= settleMs) break;
-      await sleep(pollMs);
-      continue;
-    }
-
-    const startCount = count;
-    btn.click();
-    loops += 1;
-
-    const startTime = Date.now();
-    while (Date.now() - startTime < perClickTimeoutMs) {
-      await sleep(pollMs);
-
-      const rootNow = findDirectoryRoot();
-      const sectionNow = findDirectorySection(rootNow);
-      const countNow =
-        sectionNow && sectionNow.children ? sectionNow.children.length : 0;
-
-      if (countNow > startCount) {
-        lastGrowthAt = Date.now();
-        lastCount = countNow;
-        break;
-      }
-
-      const btnNow = findLoadMoreButton(rootNow);
-      if (!btnNow) break;
-    }
-  }
-}
-
-function ensureDirectoryFullyLoadedOnce() {
-  if (directoryFullyLoaded) return Promise.resolve();
-  if (directoryLoadPromise) return directoryLoadPromise;
-
-  directoryLoadPromise = ensureAllUsersLoaded(200)
-    .then(() => {
-      directoryFullyLoaded = true;
-    })
-    .catch(() => {
-      directoryFullyLoaded = true;
-    });
-
-  return directoryLoadPromise;
-}
-
-// ----------------------
-// Extract username from card
-// ----------------------
-
-function extractUsernameFromCard(card) {
-  if (!card) return null;
-
-  const dataUsername =
-    (card.dataset && card.dataset.username) || card.getAttribute("data-username");
-  if (dataUsername) return dataUsername;
-
-  const link =
-    card.querySelector(".user-card-name a") ||
-    card.querySelector("a[href^='/u/']") ||
-    card.querySelector("a[href*='/u/']") ||
-    card.querySelector("a[data-user-card]") ||
-    card.querySelector("a.user-link");
-
-  if (link) {
-    const dataUserCard = link.getAttribute("data-user-card");
-    if (dataUserCard) return dataUserCard;
-
-    const href = link.getAttribute("href") || "";
-    const match =
-      href.match(/\/u\/([^\/\?#]+)/i) || href.match(/\/users\/([^\/\?#]+)/i);
-    if (match && match[1]) {
-      try {
-        return decodeURIComponent(match[1]);
-      } catch {
-        return match[1];
-      }
-    }
-
-    const text = (link.textContent || "").trim();
-    if (text) return text.replace(/^@/, "");
-  }
-
-  const textEl = card.querySelector(
-    ".username, .user-info .username, .user-card-name, .names span"
-  );
-  if (textEl) {
-    const t = (textEl.textContent || "").trim();
-    if (t) return t.replace(/^@/, "");
-  }
-
-  return null;
-}
-
-// ----------------------
-// Filters: server-side truth (AND)
+// Filters
 // ----------------------
 
 function buildFiltersFromForm(form) {
@@ -226,264 +112,420 @@ function buildFiltersFromForm(form) {
   return { gender, country, listen, share, hasAnyFilter };
 }
 
-async function fetchMatchingUsernames(filters) {
-  // AND-filters are applied in the plugin endpoint itself by passing multiple params.
-  if (!filters || !filters.hasAnyFilter) return null;
+// ----------------------
+// Search API
+// ----------------------
 
-  const perPage = 100;
-  let page = 1;
-  let safety = 0;
+async function fetchUsersPage(filters, page) {
+  const params = new URLSearchParams();
+  params.set("page", String(page));
+  params.set("per_page", String(searchPerPage));
+  // Keep behavior consistent with the old implementation (sorted by most recent last seen)
+  params.set("order", "last_seen");
+  params.set("asc", "false");
 
-  const set = new Set();
+  if (filters.gender) params.set("gender", filters.gender);
+  if (filters.country) params.set("country", filters.country);
+  if (filters.listen) params.set("listen", filters.listen);
+  if (filters.share) params.set("share", filters.share);
 
-  while (true) {
-    safety += 1;
-    if (safety > 300) break;
-
-    const params = new URLSearchParams();
-    params.set("page", String(page));
-    params.set("per_page", String(perPage));
-    params.set("order", "username");
-    params.set("asc", "true");
-
-    if (filters.gender) params.set("gender", filters.gender);
-    if (filters.country) params.set("country", filters.country);
-    if (filters.listen) params.set("listen", filters.listen);
-    if (filters.share) params.set("share", filters.share);
-
-    let result;
-    try {
-      result = await ajax(`/user-search.json?${params.toString()}`);
-    } catch {
-      break;
-    }
-
-    const users = (result && result.users) || [];
-    users.forEach((u) => {
-      if (u && u.username) set.add(u.username.toLowerCase());
-    });
-
-    if (users.length < perPage) break;
-    page += 1;
-  }
-
-  return set;
+  const result = await ajax(`/user-search.json?${params.toString()}`);
+  const users = (result && result.users) || [];
+  const hasMore = users.length === searchPerPage;
+  return { users, hasMore };
 }
 
 // ----------------------
-// Apply filter: show/hide by allowed username set
+// Rendering helpers
 // ----------------------
 
-function applyFiltersBySet(form, allowedSetOrNull) {
-  const directoryRoot = findDirectoryRoot();
-  if (!directoryRoot) return;
+function ensureSections() {
+  const root = findDirectoryRoot();
+  if (!root) return null;
 
-  const directorySection = findDirectorySection(directoryRoot);
-  if (!directorySection) return;
+  const section = findDirectorySection(root);
+  if (!section) return null;
 
-  const { hasAnyFilter } = buildFiltersFromForm(form);
+  // Cache the original section once
+  if (!originalSection) {
+    originalSection = section;
+    originalSectionDisplay = originalSection.style.display || "";
 
-  const cards = Array.from(directorySection.children || []);
-  let visibleCount = 0;
-
-  cards.forEach((card) => {
-    const username = extractUsernameFromCard(card);
-
-    if (!hasAnyFilter) {
-      card.style.display = "";
-      visibleCount += 1;
-      return;
+    // Cache a template card/row if present
+    if (originalSection.children && originalSection.children.length > 0) {
+      templateNode = originalSection.children[0].cloneNode(true);
     }
+  }
 
-    if (!username) {
-      card.style.display = "none";
-      return;
+  // Create results container if needed
+  if (!resultsSection) {
+    resultsSection = document.createElement(originalSection.tagName);
+    resultsSection.className = `${originalSection.className} hb-user-search-results`;
+    resultsSection.style.display = "none";
+
+    const parent = originalSection.parentElement;
+    if (parent) {
+      parent.insertBefore(resultsSection, originalSection.nextSibling);
     }
+  }
 
-    const allowed =
-      allowedSetOrNull && allowedSetOrNull.has(username.toLowerCase());
-    if (allowed) {
-      card.style.display = "";
-      visibleCount += 1;
-    } else {
-      card.style.display = "none";
-    }
-  });
+  return { root, originalSection, resultsSection };
+}
 
-  // Empty message
-  let emptyEl = directoryRoot.querySelector(".hb-user-search-empty");
+function showEmptyMessage(root, show) {
+  if (!root) return;
+
+  let emptyEl = root.querySelector(".hb-user-search-empty");
   if (!emptyEl) {
     emptyEl = document.createElement("div");
     emptyEl.className = "hb-user-search-empty";
     emptyEl.textContent = "No users found for these filters.";
     emptyEl.style.display = "none";
-    directoryRoot.appendChild(emptyEl);
+    root.appendChild(emptyEl);
   }
 
-  if (hasAnyFilter && visibleCount === 0) {
-    emptyEl.style.display = "block";
-  } else {
-    emptyEl.style.display = "none";
+  emptyEl.style.display = show ? "block" : "none";
+}
+
+function relativeAgo(tsMs) {
+  const diffMs = Date.now() - tsMs;
+  if (diffMs < 30 * 1000) return "just now";
+
+  const sec = Math.floor(diffMs / 1000);
+  if (sec < 60) return `${sec} secs ago`;
+
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min} mins ago`;
+
+  const hour = Math.floor(min / 60);
+  if (hour < 24) return `${hour} hours ago`;
+
+  const day = Math.floor(hour / 24);
+  if (day < 7) return `${day} days ago`;
+
+  const week = Math.floor(day / 7);
+  if (week < 5) return `${week} weeks ago`;
+
+  const month = Math.floor(day / 30);
+  if (month < 12) return `${month} months ago`;
+
+  const year = Math.floor(day / 365);
+  return `${year} years ago`;
+}
+
+function updateAvatar(card, avatarTemplate) {
+  if (!card || !avatarTemplate) return;
+
+  const imgs = card.querySelectorAll("img.avatar");
+  imgs.forEach((img) => {
+    const w = parseInt(img.getAttribute("width") || "", 10);
+    const h = parseInt(img.getAttribute("height") || "", 10);
+    const size = Number.isFinite(w) && w > 0 ? w : Number.isFinite(h) && h > 0 ? h : 45;
+
+    const src1x = getURL(avatarTemplate.replace("{size}", String(size)));
+    const src2x = getURL(avatarTemplate.replace("{size}", String(size * 2)));
+
+    img.setAttribute("src", src1x);
+    img.setAttribute("srcset", `${src1x} 1x, ${src2x} 2x`);
+  });
+}
+
+function updateLinks(card, username) {
+  if (!card || !username) return;
+
+  // dataset on wrapper (often used by Discourse)
+  try {
+    card.dataset.username = username;
+  } catch {
+    // ignore
+  }
+
+  // data-user-card on any link
+  card.querySelectorAll("a[data-user-card]").forEach((a) => {
+    a.setAttribute("data-user-card", username);
+  });
+
+  // Update any /u/<user> or /users/<user> hrefs within the card
+  card.querySelectorAll("a[href]").forEach((a) => {
+    const href = a.getAttribute("href") || "";
+    if (!href) return;
+
+    let updated = href;
+    updated = updated.replace(/\/u\/([^\/\?#]+)/i, `/u/${encodeURIComponent(username)}`);
+    updated = updated.replace(
+      /\/users\/([^\/\?#]+)/i,
+      `/users/${encodeURIComponent(username)}`
+    );
+
+    if (updated !== href) {
+      a.setAttribute("href", updated);
+    }
+  });
+
+  // Primary username link text
+  const nameLink =
+    card.querySelector(".user-card-name a") ||
+    card.querySelector("a[href^='/u/']") ||
+    card.querySelector("a[href^='/users/']") ||
+    card.querySelector("a.user-link");
+
+  if (nameLink) {
+    // Keep '@' behavior if it was present
+    const hadAt = (nameLink.textContent || "").trim().startsWith("@");
+    nameLink.textContent = hadAt ? `@${username}` : username;
+  }
+
+  const usernameEls = card.querySelectorAll(".username");
+  usernameEls.forEach((el) => {
+    const hadAt = (el.textContent || "").trim().startsWith("@");
+    el.textContent = hadAt ? `@${username}` : username;
+  });
+}
+
+function updateNameAndTitle(card, user) {
+  if (!card || !user) return;
+
+  const name = (user.name || "").toString();
+  const title = (user.title || "").toString();
+
+  const nameEl =
+    card.querySelector(".name") ||
+    card.querySelector(".full-name") ||
+    card.querySelector(".user-card-name .name");
+  if (nameEl) {
+    nameEl.textContent = name;
+  }
+
+  const titleEl =
+    card.querySelector(".user-title") ||
+    card.querySelector(".title") ||
+    card.querySelector(".user-card-title");
+  if (titleEl) {
+    titleEl.textContent = title;
   }
 }
 
-// ----------------------
-// Sorting: by LAST SEEN on the card itself
-// - Most recent first
-// - No "Seen ..." => bottom
-// ----------------------
+function updateSeen(card, user) {
+  if (!card || !user) return;
 
-function extractSeenTimestampFromCard(card) {
-  if (!card) return null;
+  const lastSeen = user.last_seen_at ? Date.parse(user.last_seen_at) : null;
+  if (!Number.isFinite(lastSeen)) return;
 
-  // 1) Prefer a real timestamp if present (Discourse often uses data-time / datetime)
-  // Try to find an element whose surrounding text contains "Seen"
-  const timeCandidates = Array.from(card.querySelectorAll("[data-time], time[datetime]"));
-
-  for (const el of timeCandidates) {
-    const parentText = (el.parentElement ? el.parentElement.textContent : el.textContent) || "";
+  // Update any time elements/attributes
+  const timeEls = card.querySelectorAll("[data-time], time[datetime]");
+  timeEls.forEach((el) => {
+    // Only touch ones that appear to be related to "Seen" text
+    const parentText =
+      (el.parentElement ? el.parentElement.textContent : el.textContent) || "";
     if (/seen/i.test(parentText)) {
-      // data-time is often ms since epoch in Discourse
-      const dt = el.getAttribute("data-time");
-      if (dt && /^\d+$/.test(dt)) {
-        const n = Number(dt);
-        if (Number.isFinite(n) && n > 0) return n;
-      }
-
-      const datetime = el.getAttribute("datetime");
-      if (datetime) {
-        const ts = Date.parse(datetime);
-        if (Number.isFinite(ts)) return ts;
-      }
+      el.setAttribute("data-time", String(lastSeen));
+      el.setAttribute("datetime", new Date(lastSeen).toISOString());
     }
+  });
+
+  // Update visible text if we can find a "Seen" node
+  const candidates = Array.from(card.querySelectorAll("*")).filter((el) => {
+    const t = (el.textContent || "").trim();
+    return t && /\bseen\b/i.test(t) && t.length < 80;
+  });
+
+  if (candidates.length) {
+    candidates.sort((a, b) => (a.textContent || "").length - (b.textContent || "").length);
+    candidates[0].textContent = `Seen ${relativeAgo(lastSeen)}`;
+  }
+}
+
+function buildFallbackCard(user) {
+  const wrap = document.createElement("div");
+  wrap.className = "user-card";
+
+  const username = (user.username || "").toString();
+  const name = (user.name || "").toString();
+  const title = (user.title || "").toString();
+  const avatar = user.avatar_template
+    ? getURL(user.avatar_template.replace("{size}", "45"))
+    : "";
+
+  wrap.innerHTML = `
+    <div class="user-card-name">
+      <a href="/u/${encodeURIComponent(username)}">
+        ${avatar ? `<img class="avatar" width="45" height="45" src="${avatar}" />` : ""}
+        <span class="username">${username}</span>
+      </a>
+      ${name ? `<div class="name">${name}</div>` : ""}
+      ${title ? `<div class="user-title">${title}</div>` : ""}
+    </div>
+  `;
+
+  return wrap;
+}
+
+function buildCardFromUser(user) {
+  if (!templateNode) return buildFallbackCard(user);
+
+  const card = templateNode.cloneNode(true);
+  const username = (user.username || "").toString();
+
+  updateLinks(card, username);
+  updateAvatar(card, user.avatar_template);
+  updateNameAndTitle(card, user);
+  updateSeen(card, user);
+
+  // Update common dataset/attributes if present
+  if (user.id && card.getAttribute("data-user-id") !== null) {
+    card.setAttribute("data-user-id", String(user.id));
   }
 
-  // 2) Fallback: parse from visible text e.g. "Seen just now", "Seen 7 mins ago"
-  const text = (card.textContent || "").replace(/\s+/g, " ");
-  const seenMatch = text.match(/Seen\s+(just now|\d+\s+\w+\s+ago)/i);
-  if (!seenMatch) return null;
-
-  const seenPart = seenMatch[1].toLowerCase();
-  const now = Date.now();
-
-  if (seenPart === "just now") return now;
-
-  // Examples:
-  // "1 min ago", "7 mins ago", "2 hours ago", "3 days ago"
-  const m = seenPart.match(/^(\d+)\s+(sec|secs|second|seconds|min|mins|minute|minutes|hour|hours|day|days|week|weeks|month|months|year|years)\s+ago$/i);
-  if (!m) return null;
-
-  const amount = Number(m[1]);
-  if (!Number.isFinite(amount)) return null;
-
-  const unit = m[2].toLowerCase();
-
-  let deltaMs = 0;
-  if (unit.startsWith("sec")) deltaMs = amount * 1000;
-  else if (unit.startsWith("min")) deltaMs = amount * 60 * 1000;
-  else if (unit.startsWith("hour")) deltaMs = amount * 60 * 60 * 1000;
-  else if (unit.startsWith("day")) deltaMs = amount * 24 * 60 * 60 * 1000;
-  else if (unit.startsWith("week")) deltaMs = amount * 7 * 24 * 60 * 60 * 1000;
-  else if (unit.startsWith("month")) deltaMs = amount * 30 * 24 * 60 * 60 * 1000;
-  else if (unit.startsWith("year")) deltaMs = amount * 365 * 24 * 60 * 60 * 1000;
-
-  return now - deltaMs;
+  return card;
 }
 
-function sortCardsByLastSeen() {
-  const directoryRoot = findDirectoryRoot();
-  if (!directoryRoot) return;
+function setLoading(root, isLoading) {
+  if (!root) return null;
 
-  const directorySection = findDirectorySection(directoryRoot);
-  if (!directorySection) return;
+  let loading = root.querySelector(".hb-user-search-loading");
+  if (!loading) {
+    loading = document.createElement("div");
+    loading.className = "hb-user-search-loading";
+    loading.textContent = "Preparing user search…";
+    loading.style.display = "none";
+    root.appendChild(loading);
+  }
 
-  const children = Array.from(directorySection.children || []);
-  if (children.length <= 1) return;
-
-  const decorated = children.map((node, idx) => {
-    const ts = extractSeenTimestampFromCard(node);
-    // null => never seen -> bottom
-    return { node, idx, ts };
-  });
-
-  decorated.sort((a, b) => {
-    const aHas = a.ts !== null && Number.isFinite(a.ts);
-    const bHas = b.ts !== null && Number.isFinite(b.ts);
-
-    // Both missing => keep original order
-    if (!aHas && !bHas) return a.idx - b.idx;
-
-    // Missing goes to bottom
-    if (!aHas && bHas) return 1;
-    if (aHas && !bHas) return -1;
-
-    // Both present => most recent first (DESC)
-    if (b.ts !== a.ts) return b.ts - a.ts;
-
-    // Tie-breaker stable
-    return a.idx - b.idx;
-  });
-
-  isReordering = true;
-  const frag = document.createDocumentFragment();
-  decorated.forEach((d) => frag.appendChild(d.node));
-  directorySection.appendChild(frag);
-  setTimeout(() => {
-    isReordering = false;
-  }, 0);
+  loading.style.display = isLoading ? "block" : "none";
+  return loading;
 }
 
-// ----------------------
-// MutationObserver: keep filter + sorting applied
-// ----------------------
+function updateLoadMoreButton(root) {
+  loadMoreBtn = findLoadMoreButton(root);
+  if (!loadMoreBtn) return;
 
-function stopObservingDirectory() {
-  if (directoryObserver) directoryObserver.disconnect();
-  directoryObserver = null;
+  // In search mode, we intercept load-more clicks and use it for our pagination.
+  if (searchActive && !loadMoreCaptureHandler) {
+    loadMoreCaptureHandler = async (event) => {
+      if (!searchActive) return;
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
 
-  if (scheduledReapply) clearTimeout(scheduledReapply);
-  scheduledReapply = null;
+      if (searchLoading || !searchHasMore) return;
+      await loadNextPage();
+    };
+    loadMoreBtn.addEventListener("click", loadMoreCaptureHandler, true);
+  }
+
+  // Keep the button state in sync
+  if (searchActive) {
+    loadMoreBtn.style.display = searchHasMore ? "" : "none";
+    loadMoreBtn.disabled = !!searchLoading;
+  } else {
+    loadMoreBtn.style.display = "";
+    loadMoreBtn.disabled = false;
+  }
 }
 
-function reapplyAll() {
-  if (!activeForm) return;
-  applyFiltersBySet(activeForm, activeMatchSet);
-  sortCardsByLastSeen();
+function detachLoadMoreInterceptor() {
+  if (loadMoreBtn && loadMoreCaptureHandler) {
+    loadMoreBtn.removeEventListener("click", loadMoreCaptureHandler, true);
+  }
+  loadMoreBtn = null;
+  loadMoreCaptureHandler = null;
 }
 
-function scheduleReapply() {
-  if (scheduledReapply) return;
+async function renderFirstPage() {
+  const ctx = ensureSections();
+  if (!ctx) return;
 
-  scheduledReapply = setTimeout(() => {
-    scheduledReapply = null;
+  const { root } = ctx;
+  if (!searchFilters || !searchFilters.hasAnyFilter) return;
 
-    if (isReordering) return;
+  searchLoading = true;
+  setLoading(root, true);
+  showEmptyMessage(root, false);
 
-    if (!activeForm) return;
+  // Ensure template is available (directory may have rendered after initial inject)
+  if (!templateNode && originalSection && originalSection.children?.length) {
+    templateNode = originalSection.children[0].cloneNode(true);
+  }
 
-    if (!document.contains(activeForm)) {
-      activeForm = null;
-      activeMatchSet = null;
-      stopObservingDirectory();
-      return;
-    }
+  // Switch UI to search mode
+  searchActive = true;
+  originalSection.style.display = "none";
+  resultsSection.style.display = "";
+  resultsSection.innerHTML = "";
 
-    reapplyAll();
-  }, 120);
+  searchPage = 1;
+
+  try {
+    const { users, hasMore } = await fetchUsersPage(searchFilters, searchPage);
+    searchHasMore = hasMore;
+
+    users.forEach((u) => {
+      resultsSection.appendChild(buildCardFromUser(u));
+    });
+
+    showEmptyMessage(root, users.length === 0);
+  } catch {
+    searchHasMore = false;
+    showEmptyMessage(root, true);
+  } finally {
+    searchLoading = false;
+    setLoading(root, false);
+    updateLoadMoreButton(root);
+  }
 }
 
-function startObservingDirectory() {
-  stopObservingDirectory();
+async function loadNextPage() {
+  const ctx = ensureSections();
+  if (!ctx) return;
+  const { root } = ctx;
 
-  const root = findDirectoryRoot();
-  if (!root) return;
+  if (!searchActive || !searchFilters || !searchHasMore) return;
 
-  directoryObserver = new MutationObserver(() => {
-    if (isReordering) return;
-    scheduleReapply();
-  });
+  searchLoading = true;
+  updateLoadMoreButton(root);
 
-  directoryObserver.observe(root, { childList: true, subtree: true });
+  try {
+    await sleep(150); // small debounce to avoid double clicks
+    const next = searchPage + 1;
+    const { users, hasMore } = await fetchUsersPage(searchFilters, next);
+
+    users.forEach((u) => {
+      resultsSection.appendChild(buildCardFromUser(u));
+    });
+
+    searchPage = next;
+    searchHasMore = hasMore;
+  } catch {
+    searchHasMore = false;
+  } finally {
+    searchLoading = false;
+    updateLoadMoreButton(root);
+  }
+}
+
+function exitSearchMode() {
+  const ctx = ensureSections();
+  if (!ctx) return;
+  const { root } = ctx;
+
+  searchActive = false;
+  searchFilters = null;
+  searchPage = 1;
+  searchHasMore = false;
+  searchLoading = false;
+
+  if (originalSection) {
+    originalSection.style.display = originalSectionDisplay;
+  }
+  if (resultsSection) {
+    resultsSection.style.display = "none";
+    resultsSection.innerHTML = "";
+  }
+
+  setLoading(root, false);
+  showEmptyMessage(root, false);
+  detachLoadMoreInterceptor();
+  updateLoadMoreButton(root);
 }
 
 // ----------------------
@@ -505,11 +547,9 @@ export default apiInitializer("0.11.1", (api) => {
 
     // Prevent double inject
     if (container.querySelector(".hb-user-search-filters")) {
-      // Still ensure observer + sorting are active
-      if (activeForm) {
-        startObservingDirectory();
-        sortCardsByLastSeen();
-      }
+      // Ensure we have cached sections/buttons
+      ensureSections();
+      updateLoadMoreButton(directoryRoot);
       return;
     }
 
@@ -606,86 +646,57 @@ export default apiInitializer("0.11.1", (api) => {
       const form = wrapper.querySelector(".hb-user-search-form");
       const resetButton = wrapper.querySelector(".hb-user-search-reset");
 
-      // Keep state for sorting and observer
       activeForm = form;
-      activeMatchSet = null;
-
-      // Start observer and apply initial sort
-      startObservingDirectory();
-      setTimeout(() => sortCardsByLastSeen(), 0);
+      ensureSections();
+      updateLoadMoreButton(directoryRoot);
 
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
 
-        const directoryRootNow = findDirectoryRoot();
-        let loading = directoryRootNow
-          ? directoryRootNow.querySelector(".hb-user-search-loading")
-          : null;
-
-        if (directoryRootNow) {
-          if (!loading) {
-            loading = document.createElement("div");
-            loading.className = "hb-user-search-loading";
-            loading.textContent = "Preparing user search…";
-            loading.style.display = "block";
-            directoryRootNow.appendChild(loading);
-          } else {
-            loading.style.display = "block";
-          }
-        }
-
         const filters = buildFiltersFromForm(form);
 
-        // No filters: show all, keep sorting
+        // No filters: restore original directory (no client-side hiding)
         if (!filters.hasAnyFilter) {
-          if (loading) loading.style.display = "none";
-          activeForm = form;
-          activeMatchSet = null;
-          reapplyAll();
+          exitSearchMode();
           return;
         }
 
-        // Load all users so we can show ALL matches
-        await ensureDirectoryFullyLoadedOnce();
-
-        // Fetch allowed usernames from server-side plugin filtering (AND)
-        const matchSet = await fetchMatchingUsernames(filters);
-
-        if (loading) loading.style.display = "none";
-
-        activeForm = form;
-        // If fetch fails: show none rather than wrong users
-        activeMatchSet = matchSet || new Set();
-
-        reapplyAll();
+        searchFilters = filters;
+        await renderFirstPage();
       });
 
       resetButton.addEventListener("click", () => {
-        // Reset directory load cache so future searches can re-load
-        directoryFullyLoaded = false;
-        directoryLoadPromise = null;
-
-        activeMatchSet = null;
+        // Keep the existing behavior (full reload) to reset core directory state
         window.location.reload();
       });
     });
   }
 
   api.onPageChange((url) => {
-    stopObservingDirectory();
-
     const cleanUrl = (url || "").split("#")[0];
     const isDirectory =
-      /^\/u\/?(\?.*)?$/.test(cleanUrl) || /^\/users\/?(\?.*)?$/.test(cleanUrl);
+      /^\/u\/?(\?.*)?$/.test(cleanUrl) ||
+      /^\/users\/?(\?.*)?$/.test(cleanUrl);
 
+    // Leave directory: cleanup
     if (!isDirectory) {
       activeForm = null;
-      activeMatchSet = null;
+      detachLoadMoreInterceptor();
+      // Best-effort: remove any injected results container
+      document.querySelectorAll(".hb-user-search-results").forEach((el) => el.remove());
+      exitSearchMode();
       return;
     }
 
-    directoryFullyLoaded = false;
-    directoryLoadPromise = null;
+    // Directory: reset caches and inject
+    originalSection = null;
+    templateNode = null;
+    // Remove any previous results section so we never duplicate containers
+    document.querySelectorAll(".hb-user-search-results").forEach((el) => el.remove());
+    resultsSection = null;
+    detachLoadMoreInterceptor();
+    searchActive = false;
+    searchFilters = null;
 
     setTimeout(injectFilters, 0);
   });
