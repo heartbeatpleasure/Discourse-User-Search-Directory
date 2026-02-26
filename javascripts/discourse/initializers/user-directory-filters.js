@@ -18,8 +18,15 @@ let searchPerPage = 30;
 let searchHasMore = false;
 let searchLoading = false;
 
-let loadMoreBtn = null;
-let loadMoreCaptureHandler = null;
+// Core (Ember) load-more UI
+let coreLoadMoreContainer = null;
+let coreLoadMoreDisplay = "";
+
+// Our own load-more UI in search mode (to avoid triggering Ember's loadMore)
+let searchLoadMoreContainer = null;
+let searchLoadMoreBtn = null;
+let searchLoadMoreHandler = null;
+
 let activeForm = null;
 
 function sleep(ms) {
@@ -95,6 +102,53 @@ function findLoadMoreButton(directoryRoot) {
     root.querySelector(".load-more button") ||
     root.querySelector(".load-more.btn, button.load-more")
   );
+}
+
+function findLoadMoreContainer(directoryRoot) {
+  const root = directoryRoot || findDirectoryRoot();
+  if (!root) return null;
+
+  const btn = findLoadMoreButton(root);
+  if (!btn) return null;
+
+  let container = btn.closest(".load-more") || btn.parentElement;
+
+  // If the button itself matches `.load-more`, we want its wrapper.
+  if (container === btn && btn.parentElement) {
+    container = btn.parentElement;
+  }
+
+  return container;
+}
+
+function removeEmberActionAttributes(node) {
+  if (!node || node.nodeType !== 1) return;
+
+  // Ember/Discourse commonly uses these to bind actions.
+  const attrsToRemove = [
+    "data-ember-action",
+    "data-action",
+    "data-action-id",
+    "data-action-outer-html",
+  ];
+
+  const strip = (el) => {
+    attrsToRemove.forEach((attr) => {
+      if (el.hasAttribute && el.hasAttribute(attr)) {
+        el.removeAttribute(attr);
+      }
+    });
+
+    // Remove any inline handlers that could have been cloned.
+    if (el.getAttributeNames) {
+      el.getAttributeNames()
+        .filter((n) => /^on/i.test(n))
+        .forEach((n) => el.removeAttribute(n));
+    }
+  };
+
+  strip(node);
+  node.querySelectorAll?.("*")?.forEach(strip);
 }
 
 // ----------------------
@@ -407,40 +461,104 @@ function setLoading(root, isLoading) {
   return loading;
 }
 
-function updateLoadMoreButton(root) {
-  loadMoreBtn = findLoadMoreButton(root);
-  if (!loadMoreBtn) return;
+function ensureSearchLoadMore(root) {
+  const ctx = ensureSections();
+  if (!ctx) return;
+  const { resultsSection: rs } = ctx;
 
-  // In search mode, we intercept load-more clicks and use it for our pagination.
-  if (searchActive && !loadMoreCaptureHandler) {
-    loadMoreCaptureHandler = async (event) => {
-      if (!searchActive) return;
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation();
-
-      if (searchLoading || !searchHasMore) return;
-      await loadNextPage();
-    };
-    loadMoreBtn.addEventListener("click", loadMoreCaptureHandler, true);
+  // Track core container so we can hide/show it.
+  const core = findLoadMoreContainer(root);
+  if (core) {
+    // If Discourse re-rendered, refresh reference.
+    if (!coreLoadMoreContainer || coreLoadMoreContainer !== core) {
+      coreLoadMoreContainer = core;
+      coreLoadMoreDisplay = coreLoadMoreContainer.style.display || "";
+    }
   }
 
-  // Keep the button state in sync
-  if (searchActive) {
-    loadMoreBtn.style.display = searchHasMore ? "" : "none";
-    loadMoreBtn.disabled = !!searchLoading;
-  } else {
-    loadMoreBtn.style.display = "";
-    loadMoreBtn.disabled = false;
+  // Create our own load-more container for search mode.
+  if (!searchLoadMoreContainer) {
+    if (coreLoadMoreContainer) {
+      searchLoadMoreContainer = coreLoadMoreContainer.cloneNode(true);
+      removeEmberActionAttributes(searchLoadMoreContainer);
+    } else {
+      // Fallback if Discourse changes markup and we can't find the core container.
+      searchLoadMoreContainer = document.createElement("div");
+      searchLoadMoreContainer.className = "load-more";
+      searchLoadMoreContainer.innerHTML =
+        '<button type="button" class="btn btn-primary load-more">Load More</button>';
+    }
+
+    searchLoadMoreContainer.classList.add("hb-user-search-load-more");
+    searchLoadMoreContainer.style.display = "none";
+
+    // Insert directly after our results list so UI stays in the same place.
+    const parent = rs?.parentElement || coreLoadMoreContainer?.parentElement;
+    if (parent) {
+      if (rs && rs.nextSibling) {
+        parent.insertBefore(searchLoadMoreContainer, rs.nextSibling);
+      } else {
+        parent.appendChild(searchLoadMoreContainer);
+      }
+    }
+
+    // Find the button inside our container
+    searchLoadMoreBtn =
+      searchLoadMoreContainer.querySelector("button") ||
+      (searchLoadMoreContainer.tagName === "BUTTON" ? searchLoadMoreContainer : null);
+
+    if (searchLoadMoreBtn) {
+      // Ensure the clone can't trigger Ember's actions
+      removeEmberActionAttributes(searchLoadMoreBtn);
+
+      searchLoadMoreHandler = async (event) => {
+        if (!searchActive) return;
+        event.preventDefault();
+        event.stopPropagation();
+        event.stopImmediatePropagation();
+        if (searchLoading || !searchHasMore) return;
+        await loadNextPage();
+      };
+
+      // Important: regular listener is enough because this button is not Ember-managed
+      searchLoadMoreBtn.addEventListener("click", searchLoadMoreHandler);
+    }
   }
 }
 
-function detachLoadMoreInterceptor() {
-  if (loadMoreBtn && loadMoreCaptureHandler) {
-    loadMoreBtn.removeEventListener("click", loadMoreCaptureHandler, true);
+function syncLoadMoreUI(root) {
+  ensureSearchLoadMore(root);
+
+  // Hide Discourse's core load-more during search so its infinite scroll / actions
+  // don't run (this was causing `this.model` / `loadMore` errors).
+  if (coreLoadMoreContainer) {
+    coreLoadMoreContainer.style.display = searchActive ? "none" : coreLoadMoreDisplay;
   }
-  loadMoreBtn = null;
-  loadMoreCaptureHandler = null;
+
+  // Show our sanitized load-more only in search mode.
+  if (searchLoadMoreContainer) {
+    if (searchActive && searchHasMore) {
+      searchLoadMoreContainer.style.display = "";
+    } else {
+      searchLoadMoreContainer.style.display = "none";
+    }
+  }
+
+  if (searchLoadMoreBtn) {
+    searchLoadMoreBtn.disabled = !!(searchActive && searchLoading);
+  }
+}
+
+function cleanupSearchLoadMore() {
+  if (searchLoadMoreBtn && searchLoadMoreHandler) {
+    searchLoadMoreBtn.removeEventListener("click", searchLoadMoreHandler);
+  }
+  searchLoadMoreHandler = null;
+  searchLoadMoreBtn = null;
+  if (searchLoadMoreContainer) {
+    searchLoadMoreContainer.remove();
+  }
+  searchLoadMoreContainer = null;
 }
 
 async function renderFirstPage() {
@@ -482,7 +600,7 @@ async function renderFirstPage() {
   } finally {
     searchLoading = false;
     setLoading(root, false);
-    updateLoadMoreButton(root);
+    syncLoadMoreUI(root);
   }
 }
 
@@ -494,7 +612,7 @@ async function loadNextPage() {
   if (!searchActive || !searchFilters || !searchHasMore) return;
 
   searchLoading = true;
-  updateLoadMoreButton(root);
+  syncLoadMoreUI(root);
 
   try {
     await sleep(150); // small debounce to avoid double clicks
@@ -511,7 +629,7 @@ async function loadNextPage() {
     searchHasMore = false;
   } finally {
     searchLoading = false;
-    updateLoadMoreButton(root);
+    syncLoadMoreUI(root);
   }
 }
 
@@ -536,8 +654,7 @@ function exitSearchMode() {
 
   setLoading(root, false);
   showEmptyMessage(root, false);
-  detachLoadMoreInterceptor();
-  updateLoadMoreButton(root);
+  syncLoadMoreUI(root);
 }
 
 // ----------------------
@@ -561,7 +678,7 @@ export default apiInitializer("0.11.1", (api) => {
     if (container.querySelector(".hb-user-search-filters")) {
       // Ensure we have cached sections/buttons
       ensureSections();
-      updateLoadMoreButton(directoryRoot);
+      syncLoadMoreUI(directoryRoot);
       return;
     }
 
@@ -660,7 +777,7 @@ export default apiInitializer("0.11.1", (api) => {
 
       activeForm = form;
       ensureSections();
-      updateLoadMoreButton(directoryRoot);
+      syncLoadMoreUI(directoryRoot);
 
       form.addEventListener("submit", async (event) => {
         event.preventDefault();
@@ -700,7 +817,9 @@ export default apiInitializer("0.11.1", (api) => {
     // Leave directory: cleanup
     if (!isDirectory) {
       activeForm = null;
-      detachLoadMoreInterceptor();
+      cleanupSearchLoadMore();
+      coreLoadMoreContainer = null;
+      coreLoadMoreDisplay = "";
       // Best-effort: remove any injected results container
       document.querySelectorAll(".hb-user-search-results").forEach((el) => el.remove());
       exitSearchMode();
@@ -713,7 +832,9 @@ export default apiInitializer("0.11.1", (api) => {
     // Remove any previous results section so we never duplicate containers
     document.querySelectorAll(".hb-user-search-results").forEach((el) => el.remove());
     resultsSection = null;
-    detachLoadMoreInterceptor();
+    cleanupSearchLoadMore();
+    coreLoadMoreContainer = null;
+    coreLoadMoreDisplay = "";
     searchActive = false;
     searchFilters = null;
 
