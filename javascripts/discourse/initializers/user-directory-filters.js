@@ -104,12 +104,6 @@ function injectFilters() {
     const existing = container.querySelector(".hb-user-search-form");
     if (existing) {
       const hb = readHbParams();
-      existing.querySelector("#hb-search-gender")?.setAttribute("value", hb.hb_gender || "");
-      existing.querySelector("#hb-search-country")?.setAttribute("value", hb.hb_country || "");
-      existing.querySelector("#hb-search-listen")?.setAttribute("value", hb.hb_listen || "");
-      existing.querySelector("#hb-search-share")?.setAttribute("value", hb.hb_share || "");
-
-      // Also set the actual select values (attribute alone isn't enough).
       const g = existing.querySelector("select[name='gender']");
       const c = existing.querySelector("select[name='country']");
       const l = existing.querySelector("select[name='listen']");
@@ -261,7 +255,6 @@ function injectFilters() {
 export default apiInitializer("0.11.1", (api) => {
   // Make hb_* query params first-class for the /u route so changes trigger a
   // model refresh (and thus a fresh /directory_items.json request).
-  // IMPORTANT: we must not overwrite core queryParams, so we extend them in init().
   api.modifyClass("route:users", {
     pluginId: "discourse-user-search-directory",
     init() {
