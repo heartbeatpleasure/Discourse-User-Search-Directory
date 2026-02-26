@@ -34,6 +34,109 @@ function sleep(ms) {
 }
 
 // ----------------------
+// Template detection
+// ----------------------
+
+function hasSkeletonMarkers(node) {
+  if (!node || node.nodeType !== 1) return false;
+
+  const cls = (node.className || "").toString();
+  if (/\bskeleton\b/i.test(cls)) return true;
+  if (/\bplaceholder\b/i.test(cls)) return true;
+  if (/\bis-loading\b/i.test(cls)) return true;
+  if (/\bloading-skeleton\b/i.test(cls)) return true;
+
+  // Look for common skeleton elements inside
+  return !!node.querySelector?.(
+    "[class*='skeleton'], [class*='placeholder'], .skeleton, .skeleton-line"
+  );
+}
+
+function isUsableTemplate(node) {
+  if (!node || node.nodeType !== 1) return false;
+
+  // A real directory card should have an avatar img.
+  const hasAvatarImg = !!node.querySelector?.("img.avatar");
+  if (!hasAvatarImg) return false;
+
+  // And something that clearly indicates a username.
+  const hasUsername =
+    !!node.querySelector?.(".username") ||
+    !!node.querySelector?.("a[data-user-card]") ||
+    !!node.querySelector?.("a[href^='/u/']") ||
+    !!node.querySelector?.("a[href^='/users/']");
+
+  if (!hasUsername) return false;
+
+  // Avoid caching skeleton/loading placeholders.
+  if (hasSkeletonMarkers(node)) return false;
+
+  // If there is a .username, it should contain something non-empty.
+  const u = node.querySelector?.(".username");
+  if (u && !(u.textContent || "").trim()) return false;
+
+  return true;
+}
+
+function stripSkeletonMarkers(node) {
+  if (!node || node.nodeType !== 1) return;
+
+  const stripFrom = (el) => {
+    const classes = (el.className || "").toString();
+    if (!classes) return;
+
+    // Only remove very specific loading markers to avoid visual regressions.
+    const cleaned = classes
+      .split(/\s+/)
+      .filter(
+        (c) =>
+          !/^(skeleton|placeholder|is-loading|loading-skeleton)$/i.test(c)
+      )
+      .join(" ");
+
+    if (cleaned !== classes) {
+      el.className = cleaned;
+    }
+
+    if (el.getAttribute && el.getAttribute("aria-busy") === "true") {
+      el.removeAttribute("aria-busy");
+    }
+  };
+
+  stripFrom(node);
+  node.querySelectorAll?.("*")?.forEach(stripFrom);
+}
+
+function findBestTemplateCandidate(section) {
+  if (!section || !section.children) return null;
+  const children = Array.from(section.children);
+  return children.find((c) => isUsableTemplate(c)) || null;
+}
+
+async function ensureUsableTemplate(maxWaitMs = 2500) {
+  // If we already have a good template, we're done.
+  if (templateNode && isUsableTemplate(templateNode)) return true;
+
+  const ctx = ensureSections();
+  if (!ctx) return false;
+
+  const start = Date.now();
+  while (Date.now() - start < maxWaitMs) {
+    const candidate = findBestTemplateCandidate(ctx.originalSection);
+    if (candidate) {
+      templateNode = candidate.cloneNode(true);
+      stripSkeletonMarkers(templateNode);
+      return true;
+    }
+
+    // Directory still loading, try again shortly.
+    await sleep(50);
+  }
+
+  return false;
+}
+
+// ----------------------
 // Options for dropdowns
 // ----------------------
 
@@ -204,11 +307,6 @@ function ensureSections() {
   if (!originalSection) {
     originalSection = section;
     originalSectionDisplay = originalSection.style.display || "";
-
-    // Cache a template card/row if present
-    if (originalSection.children && originalSection.children.length > 0) {
-      templateNode = originalSection.children[0].cloneNode(true);
-    }
   }
 
   // Create results container if needed
@@ -430,6 +528,7 @@ function buildCardFromUser(user) {
   if (!templateNode) return buildFallbackCard(user);
 
   const card = templateNode.cloneNode(true);
+  stripSkeletonMarkers(card);
   const username = (user.username || "").toString();
 
   updateLinks(card, username);
@@ -572,10 +671,10 @@ async function renderFirstPage() {
   setLoading(root, true);
   showEmptyMessage(root, false);
 
-  // Ensure template is available (directory may have rendered after initial inject)
-  if (!templateNode && originalSection && originalSection.children?.length) {
-    templateNode = originalSection.children[0].cloneNode(true);
-  }
+  // IMPORTANT: the directory often renders a skeleton first. If we cache that as a
+  // template, our search results will look like they are "stuck loading".
+  // Wait for a real rendered card to use as template.
+  await ensureUsableTemplate(8000);
 
   // Switch UI to search mode
   searchActive = true;
@@ -613,6 +712,11 @@ async function loadNextPage() {
 
   searchLoading = true;
   syncLoadMoreUI(root);
+
+  // Ensure template is still usable (defensive)
+  if (!templateNode) {
+    await ensureUsableTemplate(8000);
+  }
 
   try {
     await sleep(150); // small debounce to avoid double clicks
