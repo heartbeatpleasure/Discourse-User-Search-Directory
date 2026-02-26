@@ -344,26 +344,36 @@ function relativeAgo(tsMs) {
   if (diffMs < 30 * 1000) return "just now";
 
   const sec = Math.floor(diffMs / 1000);
-  if (sec < 60) return `${sec} secs ago`;
+  if (sec < 60) return `${sec} ${sec === 1 ? "sec" : "secs"} ago`;
 
   const min = Math.floor(sec / 60);
-  if (min < 60) return `${min} mins ago`;
+  if (min < 60) return `${min} ${min === 1 ? "min" : "mins"} ago`;
 
   const hour = Math.floor(min / 60);
-  if (hour < 24) return `${hour} hours ago`;
+  if (hour < 24) return `${hour} ${hour === 1 ? "hour" : "hours"} ago`;
 
   const day = Math.floor(hour / 24);
-  if (day < 7) return `${day} days ago`;
+  if (day < 7) return `${day} ${day === 1 ? "day" : "days"} ago`;
 
   const week = Math.floor(day / 7);
-  if (week < 5) return `${week} weeks ago`;
+  if (week < 5) return `${week} ${week === 1 ? "week" : "weeks"} ago`;
 
   const month = Math.floor(day / 30);
-  if (month < 12) return `${month} months ago`;
+  if (month < 12) return `${month} ${month === 1 ? "month" : "months"} ago`;
 
   const year = Math.floor(day / 365);
-  return `${year} years ago`;
+  return `${year} ${year === 1 ? "year" : "years"} ago`;
 }
+
+function isRelativeTimeText(text) {
+  const t = (text || "").trim().toLowerCase();
+  if (!t) return false;
+  if (t === "just now") return true;
+  if (t.includes(" ago")) return true;
+  // defensive for compact formats like "3m" or "2h" (in case they render like that)
+  return /^\d+\s*(s|m|h|d|w|mo|y)$/.test(t);
+}
+
 
 function updateAvatar(card, avatarTemplate) {
   if (!card || !avatarTemplate) return;
@@ -475,28 +485,114 @@ function updateSeen(card, user) {
   const lastSeen = user.last_seen_at ? Date.parse(user.last_seen_at) : null;
   if (!Number.isFinite(lastSeen)) return;
 
-  // Update any time elements/attributes
+  const agoText = relativeAgo(lastSeen);
+
+  // Try to find the smallest element that contains the word "Seen"
+  // (this should be the "Seen ..." line/container, not the whole card).
+  const seenCandidates = Array.from(card.querySelectorAll("*")).filter((el) => {
+    const t = (el.textContent || "").trim();
+    if (!t) return false;
+    if (!/\bseen\b/i.test(t)) return false;
+    if (t.length > 160) return false;
+    if (el === card) return false;
+    return true;
+  });
+
+  let seenEl = null;
+  if (seenCandidates.length) {
+    seenCandidates.sort(
+      (a, b) => (a.textContent || "").length - (b.textContent || "").length
+    );
+    seenEl = seenCandidates[0];
+  }
+
+  // 1) Prefer preserving existing relative-date markup if present.
+  // Update the first time-like element inside the seen container.
+  if (seenEl) {
+    const timeLike =
+      seenEl.querySelector(".relative-date") ||
+      seenEl.querySelector("[data-time]") ||
+      seenEl.querySelector("time[datetime]");
+
+    if (timeLike) {
+      if (timeLike.hasAttribute?.("data-time")) {
+        timeLike.setAttribute("data-time", String(lastSeen));
+      }
+      if (timeLike.tagName === "TIME" || timeLike.hasAttribute?.("datetime")) {
+        timeLike.setAttribute("datetime", new Date(lastSeen).toISOString());
+      }
+
+      // If Discourse doesn't re-render the relative-date (e.g. in our cloned nodes),
+      // ensure the visible text is correct.
+      if (isRelativeTimeText(timeLike.textContent)) {
+        timeLike.textContent = agoText;
+      }
+
+      // Ensure the container still starts with "Seen"
+      const containerText = (seenEl.textContent || "").trim();
+      if (!/^seen\b/i.test(containerText)) {
+        // Keep minimal change: prepend label if it got lost.
+        seenEl.insertAdjacentText("afterbegin", "Seen ");
+      }
+    } else {
+      // 2) Fallback: set plain text
+      seenEl.textContent = `Seen ${agoText}`;
+    }
+
+    // Remove the common duplicate trailing relative time node (e.g. "... just now")
+    // that can remain from the cloned template.
+    const parent = seenEl.parentElement;
+    if (parent) {
+      const children = Array.from(parent.childNodes || []);
+      const idx = children.indexOf(seenEl);
+
+      for (let i = idx + 1; i < children.length; i++) {
+        const node = children[i];
+        if (!node) continue;
+
+        // skip whitespace
+        if (node.nodeType === 3 && !(node.textContent || "").trim()) continue;
+
+        const text = (node.textContent || "").trim();
+        if (!text) continue;
+
+        const isTimeishElement =
+          node.nodeType === 1 &&
+          (node.matches?.(".relative-date, time, [data-time]") ||
+            /relative-date/i.test((node.className || "").toString()));
+
+        if (isTimeishElement && isRelativeTimeText(text)) {
+          node.remove();
+          continue;
+        }
+
+        // sometimes it's a text node like " just now"
+        if (node.nodeType === 3 && isRelativeTimeText(text)) {
+          node.remove();
+          continue;
+        }
+
+        // Stop once we hit something else (next meta item)
+        break;
+      }
+    }
+
+    return;
+  }
+
+  // Last resort: update any time elements/attributes whose nearby text mentions "seen"
   const timeEls = card.querySelectorAll("[data-time], time[datetime]");
   timeEls.forEach((el) => {
-    // Only touch ones that appear to be related to "Seen" text
     const parentText =
       (el.parentElement ? el.parentElement.textContent : el.textContent) || "";
     if (/seen/i.test(parentText)) {
       el.setAttribute("data-time", String(lastSeen));
       el.setAttribute("datetime", new Date(lastSeen).toISOString());
+      if (isRelativeTimeText(el.textContent)) {
+        el.textContent = agoText;
+      }
     }
   });
-
-  // Update visible text if we can find a "Seen" node
-  const candidates = Array.from(card.querySelectorAll("*")).filter((el) => {
-    const t = (el.textContent || "").trim();
-    return t && /\bseen\b/i.test(t) && t.length < 80;
-  });
-
-  if (candidates.length) {
-    candidates.sort((a, b) => (a.textContent || "").length - (b.textContent || "").length);
-    candidates[0].textContent = `Seen ${relativeAgo(lastSeen)}`;
-  }
 }
 
 function buildFallbackCard(user) {
