@@ -262,24 +262,36 @@ function updateLinks(card, username) {
     }
   });
 
-  // Primary username link text
-  const nameLink =
-    card.querySelector(".user-card-name a") ||
-    card.querySelector("a[href^='/u/']") ||
-    card.querySelector("a[href^='/users/']") ||
-    card.querySelector("a.user-link");
-
-  if (nameLink) {
-    // Keep '@' behavior if it was present
-    const hadAt = (nameLink.textContent || "").trim().startsWith("@");
-    nameLink.textContent = hadAt ? `@${username}` : username;
-  }
+  // IMPORTANT:
+  // Don't set `textContent` on the whole <a> element because it can contain
+  // nested avatar <img> markup. That would delete the avatar and leave only the
+  // username link (exactly the issue you saw).
 
   const usernameEls = card.querySelectorAll(".username");
   usernameEls.forEach((el) => {
     const hadAt = (el.textContent || "").trim().startsWith("@");
     el.textContent = hadAt ? `@${username}` : username;
   });
+
+  // Fallback: if no explicit .username elements exist, update a likely name link
+  // but ONLY when it has no element children (so we never destroy avatars).
+  if (!usernameEls.length) {
+    const nameLink =
+      card.querySelector(".user-card-name a") ||
+      card.querySelector("a[href^='/u/']") ||
+      card.querySelector("a[href^='/users/']") ||
+      card.querySelector("a.user-link");
+
+    if (nameLink) {
+      const hasElementChildren = Array.from(nameLink.childNodes || []).some(
+        (n) => n && n.nodeType === 1
+      );
+      if (!hasElementChildren) {
+        const hadAt = (nameLink.textContent || "").trim().startsWith("@");
+        nameLink.textContent = hadAt ? `@${username}` : username;
+      }
+    }
+  }
 }
 
 function updateNameAndTitle(card, user) {
@@ -666,8 +678,15 @@ export default apiInitializer("0.11.1", (api) => {
       });
 
       resetButton.addEventListener("click", () => {
-        // Keep the existing behavior (full reload) to reset core directory state
-        window.location.reload();
+        // Do NOT refresh the page (e.g. livestream would stop).
+        // Just clear fields + show the original directory again.
+        try {
+          form.reset();
+        } catch {
+          // ignore
+        }
+
+        exitSearchMode();
       });
     });
   }
