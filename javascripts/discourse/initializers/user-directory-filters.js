@@ -21,7 +21,8 @@ function fetchOptions() {
   if (optionsCache) return Promise.resolve(optionsCache);
   if (optionsPromise) return optionsPromise;
 
-  optionsPromise = ajax("/user_search/options.json")
+  // NOTE: hyphen, not underscore
+  optionsPromise = ajax("/user-search/options.json")
     .then((res) => {
       optionsCache = res || {};
       return optionsCache;
@@ -63,10 +64,7 @@ function readSortParams(url = window.location.href) {
   const order = (sp.get("order") || "").trim() || "last_seen";
   const direction = sp.has("asc") ? "asc" : "desc";
 
-  return {
-    order,
-    direction,
-  };
+  return { order, direction };
 }
 
 function defaultDirectionFor(order) {
@@ -87,8 +85,8 @@ function directionLabelsFor(order) {
   return { desc: "Newest first", asc: "Oldest first" };
 }
 
-function buildUrlWithParams({ hb, sort }) {
-  const u = new URL(window.location.href, window.location.origin);
+function buildUrlWithParams({ hb, sort }, baseUrl = window.location.href) {
+  const u = new URL(baseUrl, window.location.origin);
   const sp = u.searchParams;
 
   // Apply hb_*
@@ -113,22 +111,40 @@ function buildUrlWithParams({ hb, sort }) {
 
 function applyDirectoryParams({ hb, sort }) {
   DiscourseURL.routeTo(buildUrlWithParams({ hb, sort }));
-  // empty-state text may render after data loads; try a few times.
   setTimeout(updateEmptyStateMessage, 0);
   setTimeout(updateEmptyStateMessage, 250);
   setTimeout(updateEmptyStateMessage, 900);
 }
 
-function updateEmptyStateMessage() {
-  if (!filtersPresent()) return;
+function ensureDefaultSortInUrl(url) {
+  const u = new URL(url || window.location.href, window.location.origin);
+  const sp = u.searchParams;
 
+  // If no explicit order yet, set default order=last_seen (desc)
+  if (!sp.get("order")) {
+    const next = buildUrlWithParams(
+      { hb: readHbParams(u.href), sort: { order: "last_seen", direction: "desc" } },
+      u.href
+    );
+
+    // routeTo only if it would change anything (avoid loops)
+    if (next !== (u.pathname + (u.search ? `?${u.searchParams.toString()}` : ""))) {
+      DiscourseURL.routeTo(next);
+      return true;
+    }
+  }
+  return false;
+}
+
+function updateEmptyStateMessage() {
   const directoryRoot = findDirectoryRoot();
   if (!directoryRoot) return;
 
   const empty = directoryRoot.querySelector(".empty-state-body p");
   if (!empty) return;
 
-  // Only replace the long "brand new" message shown for an empty directory.
+  // Replace Discourse's confusing "brand new community" copy with a neutral message.
+  // We do this only on /u (directory) so other pages aren't affected.
   empty.textContent = "No results found.";
 }
 
@@ -158,12 +174,8 @@ function renderSortControls(currentSort) {
   }).join("");
 
   const directionOptions = [
-    `<option value="desc" ${direction === "desc" ? "selected" : ""}>${
-      labels.desc
-    }</option>`,
-    `<option value="asc" ${direction === "asc" ? "selected" : ""}>${
-      labels.asc
-    }</option>`,
+    `<option value="desc" ${direction === "desc" ? "selected" : ""}>${labels.desc}</option>`,
+    `<option value="asc" ${direction === "asc" ? "selected" : ""}>${labels.asc}</option>`,
   ].join("");
 
   return `
@@ -199,7 +211,6 @@ function injectFilters() {
 
   // Prevent double inject
   if (container.querySelector(".hb-user-search-filters")) {
-    // Update form values from URL (e.g. back/forward navigation)
     const existing = container.querySelector(".hb-user-search-form");
     if (existing) {
       const hb = readHbParams();
@@ -220,7 +231,6 @@ function injectFilters() {
       if (sortDir) {
         const desired = sortState.direction || defaultDirectionFor(sortBy.value);
         sortDir.value = desired;
-        // Update option labels to match the current order type.
         const labels = directionLabelsFor(sortBy.value);
         const opts = sortDir.querySelectorAll("option");
         opts.forEach((opt) => {
@@ -229,18 +239,12 @@ function injectFilters() {
         });
       }
     }
-
-    updateEmptyStateMessage();
     return;
   }
 
   fetchOptions().then((opt) => {
-    const listenValues = (opt.listen || []).filter(
-      (option) => option !== "No preference"
-    );
-    const shareValues = (opt.share || []).filter(
-      (option) => option !== "No preference"
-    );
+    const listenValues = (opt.listen || []).filter((o) => o !== "No preference");
+    const shareValues = (opt.share || []).filter((o) => o !== "No preference");
 
     const genderOptions = withDoNotConsider(opt.gender);
     const countryOptions = withDoNotConsider(opt.country);
@@ -261,9 +265,7 @@ function injectFilters() {
               ${genderOptions
                 .map(
                   (option) =>
-                    `<option value="${
-                      option === "Do not consider" ? "" : option
-                    }">${option}</option>`
+                    `<option value="${option === "Do not consider" ? "" : option}">${option}</option>`
                 )
                 .join("")}
             </select>
@@ -275,9 +277,7 @@ function injectFilters() {
               ${countryOptions
                 .map(
                   (option) =>
-                    `<option value="${
-                      option === "Do not consider" ? "" : option
-                    }">${option}</option>`
+                    `<option value="${option === "Do not consider" ? "" : option}">${option}</option>`
                 )
                 .join("")}
             </select>
@@ -289,9 +289,7 @@ function injectFilters() {
               ${listenOptions
                 .map(
                   (option) =>
-                    `<option value="${
-                      option === "Do not consider" ? "" : option
-                    }">${option}</option>`
+                    `<option value="${option === "Do not consider" ? "" : option}">${option}</option>`
                 )
                 .join("")}
             </select>
@@ -303,9 +301,7 @@ function injectFilters() {
               ${shareOptions
                 .map(
                   (option) =>
-                    `<option value="${
-                      option === "Do not consider" ? "" : option
-                    }">${option}</option>`
+                    `<option value="${option === "Do not consider" ? "" : option}">${option}</option>`
                 )
                 .join("")}
             </select>
@@ -321,7 +317,6 @@ function injectFilters() {
       </form>
     `;
 
-    // Place directly under controls
     if (controls.nextSibling) {
       container.insertBefore(wrapper, controls.nextSibling);
     } else {
@@ -357,8 +352,6 @@ function injectFilters() {
           if (optEl.value === "asc") optEl.textContent = labels.asc;
           if (optEl.value === "desc") optEl.textContent = labels.desc;
         });
-
-        // If the user hasn't explicitly chosen, switch to the default for this field.
         sortDirection.value = defaultDirectionFor(sortBy.value);
       });
     }
@@ -385,25 +378,22 @@ function injectFilters() {
 
     resetButton.addEventListener("click", () => {
       // Do NOT refresh the page (e.g. livestream would stop).
-      // Just clear fields + remove hb_* query params.
       try {
         form.reset();
       } catch {
         // ignore
       }
 
-      // Reset sorting to defaults (last seen, newest first).
-      const sortByEl = form.querySelector("select[name='sortBy']");
-      const sortDirEl = form.querySelector("select[name='sortDirection']");
-      if (sortByEl) sortByEl.value = "last_seen";
-      if (sortDirEl) {
+      // Reset sort UI labels + values
+      if (sortBy) sortBy.value = "last_seen";
+      if (sortDirection) {
         const labels = directionLabelsFor("last_seen");
-        const opts = sortDirEl.querySelectorAll("option");
+        const opts = sortDirection.querySelectorAll("option");
         opts.forEach((optEl) => {
           if (optEl.value === "asc") optEl.textContent = labels.asc;
           if (optEl.value === "desc") optEl.textContent = labels.desc;
         });
-        sortDirEl.value = "desc";
+        sortDirection.value = "desc";
       }
 
       applyDirectoryParams({
@@ -411,8 +401,6 @@ function injectFilters() {
         sort: { order: "last_seen", direction: "desc" },
       });
     });
-
-    updateEmptyStateMessage();
   });
 }
 
@@ -432,26 +420,30 @@ export default apiInitializer("0.11.1", (api) => {
       this.queryParams.hb_country = { refreshModel: true };
       this.queryParams.hb_listen = { refreshModel: true };
       this.queryParams.hb_share = { refreshModel: true };
+      // Sorting params should also refresh the model
+      this.queryParams.order = { refreshModel: true };
+      this.queryParams.asc = { refreshModel: true };
     },
   });
 
-  // Defensive: define properties on the controller so Ember doesn't warn.
   api.modifyClass("controller:users", {
     pluginId: "discourse-user-search-directory",
     hb_gender: null,
     hb_country: null,
     hb_listen: null,
     hb_share: null,
+    order: null,
+    asc: null,
   });
 
   api.onPageChange((url) => {
     const cleanUrl = (url || "").split("#")[0];
-    const isDirectory =
-      /^\/u\/?(\?.*)?$/.test(cleanUrl) || /^\/users\/?(\?.*)?$/.test(cleanUrl);
-
+    const isDirectory = /^\/u\/?(\?.*)?$/.test(cleanUrl) || /^\/users\/?(\?.*)?$/.test(cleanUrl);
     if (!isDirectory) return;
 
-    // Let the page render first.
+    // Ensure default sorting is applied once (no hard refresh, just route change).
+    if (ensureDefaultSortInUrl(cleanUrl)) return;
+
     setTimeout(injectFilters, 0);
     setTimeout(updateEmptyStateMessage, 250);
   });
