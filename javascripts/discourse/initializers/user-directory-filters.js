@@ -8,13 +8,10 @@ let optionsPromise = null;
 const HB_KEYS = ["hb_gender", "hb_country", "hb_listen", "hb_share"];
 
 const SORT_FIELDS = [
-  { value: "last_seen_at", label: "Last seen", defaultDir: "desc" },
-  { value: "username", label: "Username", defaultDir: "asc" },
-  { value: "created_at", label: "Join date", defaultDir: "desc" },
+  { value: "last_seen", label: "Last seen" },
+  { value: "username", label: "Username" },
+  { value: "joined", label: "Join date" },
 ];
-
-const DEFAULT_ORDER = "last_seen_at";
-const DEFAULT_DIR = "desc";
 
 // ----------------------
 // Options for dropdowns
@@ -24,14 +21,9 @@ function fetchOptions() {
   if (optionsCache) return Promise.resolve(optionsCache);
   if (optionsPromise) return optionsPromise;
 
-  optionsPromise = ajax("/user-search/options.json")
-    .then((result) => {
-      optionsCache = {
-        gender: result.gender || [],
-        country: result.country || [],
-        listen: result.listen || [],
-        share: result.share || [],
-      };
+  optionsPromise = ajax("/user_search/options.json")
+    .then((res) => {
+      optionsCache = res || {};
       return optionsCache;
     })
     .catch(() => {
@@ -42,97 +34,110 @@ function fetchOptions() {
   return optionsPromise;
 }
 
-function withDoNotConsider(list) {
-  return ["Do not consider", ...(list || [])];
+function withDoNotConsider(arr) {
+  const list = Array.isArray(arr) ? arr.slice() : [];
+  return ["Do not consider", ...list];
 }
 
-// ----------------------
-// Sort helpers
-// ----------------------
+function readHbParams(url = window.location.href) {
+  const u = new URL(url, window.location.origin);
+  const sp = u.searchParams;
 
-function defaultDirFor(order) {
-  const found = SORT_FIELDS.find((f) => f.value === order);
-  return found?.defaultDir || DEFAULT_DIR;
-}
-
-function readDirParams() {
-  const sp = new URLSearchParams(window.location.search);
-
-  const hb = {};
+  const out = {};
   HB_KEYS.forEach((k) => {
-    hb[k] = (sp.get(k) || "").toString();
+    const v = sp.get(k);
+    if (v) out[k] = v;
+  });
+  return out;
+}
+
+function filtersPresent(url = window.location.href) {
+  const hb = readHbParams(url);
+  return HB_KEYS.some((k) => (hb[k] || "").trim().length > 0);
+}
+
+function readSortParams(url = window.location.href) {
+  const u = new URL(url, window.location.origin);
+  const sp = u.searchParams;
+
+  const order = (sp.get("order") || "").trim() || "last_seen";
+  const direction = sp.has("asc") ? "asc" : "desc";
+
+  return {
+    order,
+    direction,
+  };
+}
+
+function defaultDirectionFor(order) {
+  switch (order) {
+    case "username":
+      return "asc";
+    case "joined":
+    case "last_seen":
+    default:
+      return "desc";
+  }
+}
+
+function directionLabelsFor(order) {
+  if (order === "username") {
+    return { asc: "A → Z", desc: "Z → A" };
+  }
+  return { desc: "Newest first", asc: "Oldest first" };
+}
+
+function buildUrlWithParams({ hb, sort }) {
+  const u = new URL(window.location.href, window.location.origin);
+  const sp = u.searchParams;
+
+  // Apply hb_*
+  HB_KEYS.forEach((k) => {
+    const v = (hb?.[k] || "").toString().trim();
+    if (v) sp.set(k, v);
+    else sp.delete(k);
   });
 
-  const order = (sp.get("order") || "").toString();
-  const asc = (sp.get("asc") || "").toString() === "true";
-  const dir = asc ? "asc" : "desc";
+  // Apply sorting
+  const order = (sort?.order || "").toString().trim() || "last_seen";
+  sp.set("order", order);
 
-  return { hb, order, dir };
+  const direction = sort?.direction === "asc" ? "asc" : "desc";
+  if (direction === "asc") sp.set("asc", "1");
+  else sp.delete("asc");
+
+  // Keep URL pretty
+  u.search = sp.toString();
+  return u.pathname + (u.search ? `?${u.search}` : "");
+}
+
+function applyDirectoryParams({ hb, sort }) {
+  DiscourseURL.routeTo(buildUrlWithParams({ hb, sort }));
+  // empty-state text may render after data loads; try a few times.
+  setTimeout(updateEmptyStateMessage, 0);
+  setTimeout(updateEmptyStateMessage, 250);
+  setTimeout(updateEmptyStateMessage, 900);
+}
+
+function updateEmptyStateMessage() {
+  if (!filtersPresent()) return;
+
+  const directoryRoot = findDirectoryRoot();
+  if (!directoryRoot) return;
+
+  const empty = directoryRoot.querySelector(".empty-state-body p");
+  if (!empty) return;
+
+  // Only replace the long "brand new" message shown for an empty directory.
+  empty.textContent = "No results found.";
 }
 
 // ----------------------
-// URL helpers
-// ----------------------
-
-function buildUrlWithParams({ hb, order, dir } = {}) {
-  const url = new URL(window.location.href);
-
-  // hb_* filters
-  if (hb) {
-    HB_KEYS.forEach((k) => {
-      const v = (hb && hb[k]) || "";
-      if (v) {
-        url.searchParams.set(k, v);
-      } else {
-        url.searchParams.delete(k);
-      }
-    });
-  }
-
-  // sort
-  if (order !== undefined) {
-    const v = (order || "").toString();
-    if (v) {
-      url.searchParams.set("order", v);
-    } else {
-      url.searchParams.delete("order");
-    }
-  }
-
-  if (dir !== undefined) {
-    const d = (dir || "").toString();
-    if (d === "asc") {
-      url.searchParams.set("asc", "true");
-    } else {
-      url.searchParams.delete("asc"); // default in Discourse is DESC when omitted
-    }
-  }
-
-  const qs = url.searchParams.toString();
-  return `${url.pathname}${qs ? `?${qs}` : ""}`;
-}
-
-function applyParams(next, { replace } = {}) {
-  const nextUrl = buildUrlWithParams(next);
-
-  // Prefer replaceState to avoid adding a history entry for "default sort" normalization
-  if (replace && typeof DiscourseURL.replaceState === "function") {
-    DiscourseURL.replaceState(nextUrl);
-    // replaceState doesn't refresh the model, so we still need a transition
-    DiscourseURL.routeTo(nextUrl);
-    return;
-  }
-
-  DiscourseURL.routeTo(nextUrl);
-}
-
-// ----------------------
-// DOM helpers
+// UI injection
 // ----------------------
 
 function findDirectoryRoot() {
   return (
-    document.querySelector(".users-directory") ||
     document.querySelector(".directory.users") ||
     document.querySelector(".users-directory.directory") ||
     document.querySelector(".users-directory-container") ||
@@ -142,36 +147,42 @@ function findDirectoryRoot() {
   );
 }
 
-function ensureDefaultSort() {
-  const sp = new URLSearchParams(window.location.search);
-  if (sp.get("order")) return;
+function renderSortControls(currentSort) {
+  const order = currentSort.order || "last_seen";
+  const direction = currentSort.direction || defaultDirectionFor(order);
+  const labels = directionLabelsFor(order);
 
-  // Default sort: last seen (newest first)
-  applyParams({ order: DEFAULT_ORDER, dir: DEFAULT_DIR }, { replace: true });
-}
+  const sortOptions = SORT_FIELDS.map((f) => {
+    const selected = f.value === order ? "selected" : "";
+    return `<option value="${f.value}" ${selected}>${f.label}</option>`;
+  }).join("");
 
-function syncFormFromUrl(form) {
-  if (!form) return;
+  const directionOptions = [
+    `<option value="desc" ${direction === "desc" ? "selected" : ""}>${
+      labels.desc
+    }</option>`,
+    `<option value="asc" ${direction === "asc" ? "selected" : ""}>${
+      labels.asc
+    }</option>`,
+  ].join("");
 
-  const { hb, order, dir } = readDirParams();
+  return `
+    <div class="hb-user-search-grid hb-user-search-grid--sort">
+      <div class="hb-user-search-field">
+        <label for="hb-search-sort-by">Sort by</label>
+        <select name="sortBy" id="hb-search-sort-by">
+          ${sortOptions}
+        </select>
+      </div>
 
-  const g = form.querySelector("select[name='gender']");
-  const c = form.querySelector("select[name='country']");
-  const l = form.querySelector("select[name='listen']");
-  const s = form.querySelector("select[name='share']");
-  const sb = form.querySelector("select[name='sort_by']");
-  const sd = form.querySelector("select[name='sort_dir']");
-
-  if (g) g.value = hb.hb_gender || "";
-  if (c) c.value = hb.hb_country || "";
-  if (l) l.value = hb.hb_listen || "";
-  if (s) s.value = hb.hb_share || "";
-
-  const effectiveOrder = order || DEFAULT_ORDER;
-  const effectiveDir = order ? dir : defaultDirFor(effectiveOrder);
-
-  if (sb) sb.value = effectiveOrder;
-  if (sd) sd.value = effectiveDir;
+      <div class="hb-user-search-field">
+        <label for="hb-search-sort-direction">Sort direction</label>
+        <select name="sortDirection" id="hb-search-sort-direction">
+          ${directionOptions}
+        </select>
+      </div>
+    </div>
+  `;
 }
 
 function injectFilters() {
@@ -187,10 +198,39 @@ function injectFilters() {
   const container = controls.parentElement || directoryRoot;
 
   // Prevent double inject
-  const existingWrapper = container.querySelector(".hb-user-search-filters");
-  if (existingWrapper) {
-    const existingForm = existingWrapper.querySelector(".hb-user-search-form");
-    syncFormFromUrl(existingForm);
+  if (container.querySelector(".hb-user-search-filters")) {
+    // Update form values from URL (e.g. back/forward navigation)
+    const existing = container.querySelector(".hb-user-search-form");
+    if (existing) {
+      const hb = readHbParams();
+      const g = existing.querySelector("select[name='gender']");
+      const c = existing.querySelector("select[name='country']");
+      const l = existing.querySelector("select[name='listen']");
+      const s = existing.querySelector("select[name='share']");
+      if (g) g.value = hb.hb_gender || "";
+      if (c) c.value = hb.hb_country || "";
+      if (l) l.value = hb.hb_listen || "";
+      if (s) s.value = hb.hb_share || "";
+
+      const sortState = readSortParams();
+      const sortBy = existing.querySelector("select[name='sortBy']");
+      const sortDir = existing.querySelector("select[name='sortDirection']");
+      if (sortBy) sortBy.value = sortState.order || "last_seen";
+
+      if (sortDir) {
+        const desired = sortState.direction || defaultDirectionFor(sortBy.value);
+        sortDir.value = desired;
+        // Update option labels to match the current order type.
+        const labels = directionLabelsFor(sortBy.value);
+        const opts = sortDir.querySelectorAll("option");
+        opts.forEach((opt) => {
+          if (opt.value === "asc") opt.textContent = labels.asc;
+          if (opt.value === "desc") opt.textContent = labels.desc;
+        });
+      }
+    }
+
+    updateEmptyStateMessage();
     return;
   }
 
@@ -210,9 +250,7 @@ function injectFilters() {
     const wrapper = document.createElement("div");
     wrapper.className = "hb-user-search-filters";
 
-    const sortOptionsHtml = SORT_FIELDS.map(
-      (f) => `<option value="${f.value}">${f.label}</option>`
-    ).join("");
+    const currentSort = readSortParams();
 
     wrapper.innerHTML = `
       <form class="hb-user-search-form">
@@ -272,22 +310,9 @@ function injectFilters() {
                 .join("")}
             </select>
           </div>
-
-          <div class="hb-user-search-field">
-            <label for="hb-search-sort-by">Sort by</label>
-            <select name="sort_by" id="hb-search-sort-by">
-              ${sortOptionsHtml}
-            </select>
-          </div>
-
-          <div class="hb-user-search-field">
-            <label for="hb-search-sort-dir">Direction</label>
-            <select name="sort_dir" id="hb-search-sort-dir">
-              <option value="asc">ASC</option>
-              <option value="desc">DESC</option>
-            </select>
-          </div>
         </div>
+
+        ${renderSortControls(currentSort)}
 
         <div class="hb-user-search-actions">
           <button type="submit" class="btn btn-primary">Search users</button>
@@ -307,15 +332,34 @@ function injectFilters() {
     const resetButton = wrapper.querySelector(".hb-user-search-reset");
 
     // Prefill from current URL query params
-    syncFormFromUrl(form);
+    const hb = readHbParams();
+    const gender = form.querySelector("select[name='gender']");
+    const country = form.querySelector("select[name='country']");
+    const listen = form.querySelector("select[name='listen']");
+    const share = form.querySelector("select[name='share']");
+    if (gender) gender.value = hb.hb_gender || "";
+    if (country) country.value = hb.hb_country || "";
+    if (listen) listen.value = hb.hb_listen || "";
+    if (share) share.value = hb.hb_share || "";
 
-    const sortBy = form.querySelector("select[name='sort_by']");
-    const sortDir = form.querySelector("select[name='sort_dir']");
+    // Sort prefill
+    const sortBy = form.querySelector("select[name='sortBy']");
+    const sortDirection = form.querySelector("select[name='sortDirection']");
+    if (sortBy) sortBy.value = currentSort.order || "last_seen";
+    if (sortDirection) sortDirection.value = currentSort.direction || defaultDirectionFor(sortBy.value);
 
-    if (sortBy && sortDir) {
-      // When sort field changes, set its expected default direction.
+    // Update direction option labels when sortBy changes
+    if (sortBy && sortDirection) {
       sortBy.addEventListener("change", () => {
-        sortDir.value = defaultDirFor(sortBy.value);
+        const labels = directionLabelsFor(sortBy.value);
+        const opts = sortDirection.querySelectorAll("option");
+        opts.forEach((optEl) => {
+          if (optEl.value === "asc") optEl.textContent = labels.asc;
+          if (optEl.value === "desc") optEl.textContent = labels.desc;
+        });
+
+        // If the user hasn't explicitly chosen, switch to the default for this field.
+        sortDirection.value = defaultDirectionFor(sortBy.value);
       });
     }
 
@@ -323,19 +367,20 @@ function injectFilters() {
       event.preventDefault();
 
       const fd = new FormData(form);
-      const hb = {
+      const nextHb = {
         hb_gender: (fd.get("gender") || "").toString().trim(),
         hb_country: (fd.get("country") || "").toString().trim(),
         hb_listen: (fd.get("listen") || "").toString().trim(),
         hb_share: (fd.get("share") || "").toString().trim(),
       };
 
-      const order = (fd.get("sort_by") || DEFAULT_ORDER).toString().trim();
-      const dir =
-        (fd.get("sort_dir") || defaultDirFor(order)).toString().trim() ||
-        defaultDirFor(order);
+      const order = (fd.get("sortBy") || "last_seen").toString().trim() || "last_seen";
+      const direction =
+        (fd.get("sortDirection") || defaultDirectionFor(order)).toString().trim() === "asc"
+          ? "asc"
+          : "desc";
 
-      applyParams({ hb, order, dir });
+      applyDirectoryParams({ hb: nextHb, sort: { order, direction } });
     });
 
     resetButton.addEventListener("click", () => {
@@ -347,16 +392,27 @@ function injectFilters() {
         // ignore
       }
 
-      // Reset sort to defaults too
-      if (sortBy) sortBy.value = DEFAULT_ORDER;
-      if (sortDir) sortDir.value = DEFAULT_DIR;
+      // Reset sorting to defaults (last seen, newest first).
+      const sortByEl = form.querySelector("select[name='sortBy']");
+      const sortDirEl = form.querySelector("select[name='sortDirection']");
+      if (sortByEl) sortByEl.value = "last_seen";
+      if (sortDirEl) {
+        const labels = directionLabelsFor("last_seen");
+        const opts = sortDirEl.querySelectorAll("option");
+        opts.forEach((optEl) => {
+          if (optEl.value === "asc") optEl.textContent = labels.asc;
+          if (optEl.value === "desc") optEl.textContent = labels.desc;
+        });
+        sortDirEl.value = "desc";
+      }
 
-      applyParams({
+      applyDirectoryParams({
         hb: { hb_gender: "", hb_country: "", hb_listen: "", hb_share: "" },
-        order: DEFAULT_ORDER,
-        dir: DEFAULT_DIR,
+        sort: { order: "last_seen", direction: "desc" },
       });
     });
+
+    updateEmptyStateMessage();
   });
 }
 
@@ -376,10 +432,6 @@ export default apiInitializer("0.11.1", (api) => {
       this.queryParams.hb_country = { refreshModel: true };
       this.queryParams.hb_listen = { refreshModel: true };
       this.queryParams.hb_share = { refreshModel: true };
-
-      // Ensure sorting changes refresh the directory model as well.
-      this.queryParams.order = this.queryParams.order || { refreshModel: true };
-      this.queryParams.asc = this.queryParams.asc || { refreshModel: true };
     },
   });
 
@@ -390,8 +442,6 @@ export default apiInitializer("0.11.1", (api) => {
     hb_country: null,
     hb_listen: null,
     hb_share: null,
-    order: null,
-    asc: null,
   });
 
   api.onPageChange((url) => {
@@ -401,10 +451,8 @@ export default apiInitializer("0.11.1", (api) => {
 
     if (!isDirectory) return;
 
-    // Default sort to "last seen" if none is specified
-    ensureDefaultSort();
-
     // Let the page render first.
     setTimeout(injectFilters, 0);
+    setTimeout(updateEmptyStateMessage, 250);
   });
 });
