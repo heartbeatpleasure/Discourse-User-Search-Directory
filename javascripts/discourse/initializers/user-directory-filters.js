@@ -13,6 +13,19 @@ const SORT_FIELDS = [
   { value: "joined", label: "Join date" },
 ];
 
+function normalizeSortOrder(order) {
+  const o = (order || "").toString().trim();
+  return SORT_FIELDS.some((f) => f.value === o) ? o : "last_seen";
+}
+
+function setSelectValueIfPresent(selectEl, desiredValue, fallbackValue) {
+  if (!selectEl) return;
+  const desired = (desiredValue || "").toString();
+  const fallback = (fallbackValue || "").toString();
+  const hasDesired = Array.from(selectEl.options).some((o) => o.value === desired);
+  selectEl.value = hasDesired ? desired : fallback;
+}
+
 // ----------------------
 // Options for dropdowns
 // ----------------------
@@ -106,7 +119,11 @@ function buildUrlWithParams({ hb, sort }, baseUrl = window.location.href) {
 
   // Keep URL pretty
   u.search = sp.toString();
-  return u.pathname + (u.search ? `?${u.search}` : "");
+
+  // NOTE: URL.search already includes the leading `?` when present.
+  // Returning `?${u.search}` would create a `??` prefix, which breaks query param parsing
+  // (the first param becomes `?param=` and gets ignored by Discourse/Ember).
+  return u.pathname + u.search;
 }
 
 function applyDirectoryParams({ hb, sort }) {
@@ -128,7 +145,7 @@ function ensureDefaultSortInUrl(url) {
     );
 
     // routeTo only if it would change anything (avoid loops)
-    if (next !== (u.pathname + (u.search ? `?${u.searchParams.toString()}` : ""))) {
+    if (next !== (u.pathname + u.search)) {
       DiscourseURL.routeTo(next);
       return true;
     }
@@ -164,7 +181,7 @@ function findDirectoryRoot() {
 }
 
 function renderSortControls(currentSort) {
-  const order = currentSort.order || "last_seen";
+  const order = normalizeSortOrder(currentSort.order || "last_seen");
   const direction = currentSort.direction || defaultDirectionFor(order);
   const labels = directionLabelsFor(order);
 
@@ -226,12 +243,19 @@ function injectFilters() {
       const sortState = readSortParams();
       const sortBy = existing.querySelector("select[name='sortBy']");
       const sortDir = existing.querySelector("select[name='sortDirection']");
-      if (sortBy) sortBy.value = sortState.order || "last_seen";
+      if (sortBy) {
+        setSelectValueIfPresent(
+          sortBy,
+          normalizeSortOrder(sortState.order || "last_seen"),
+          "last_seen"
+        );
+      }
 
       if (sortDir) {
-        const desired = sortState.direction || defaultDirectionFor(sortBy.value);
-        sortDir.value = desired;
-        const labels = directionLabelsFor(sortBy.value);
+        const currentOrder = sortBy?.value || "last_seen";
+        const desired = sortState.direction || defaultDirectionFor(currentOrder);
+        setSelectValueIfPresent(sortDir, desired, defaultDirectionFor(currentOrder));
+        const labels = directionLabelsFor(currentOrder);
         const opts = sortDir.querySelectorAll("option");
         opts.forEach((opt) => {
           if (opt.value === "asc") opt.textContent = labels.asc;
