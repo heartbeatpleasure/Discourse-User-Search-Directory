@@ -26,6 +26,30 @@ function setSelectValueIfPresent(selectEl, desiredValue, fallbackValue) {
   selectEl.value = hasDesired ? desired : fallback;
 }
 
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => {
+    switch (char) {
+      case "&":
+        return "&amp;";
+      case "<":
+        return "&lt;";
+      case ">":
+        return "&gt;";
+      case '"':
+        return "&quot;";
+      case "'":
+        return "&#39;";
+      default:
+        return char;
+    }
+  });
+}
+
+function renderOption(option) {
+  const value = option === "Do not consider" ? "" : option;
+  return `<option value="${escapeHtml(value)}">${escapeHtml(option)}</option>`;
+}
+
 // ----------------------
 // Options for dropdowns
 // ----------------------
@@ -41,7 +65,13 @@ function fetchOptions() {
       return optionsCache;
     })
     .catch(() => {
-      optionsCache = { gender: [], country: [], listen: [], share: [] };
+      optionsCache = {
+        gender: [],
+        country: [],
+        listen: [],
+        share: [],
+        directory_integration_available: false,
+      };
       return optionsCache;
     });
 
@@ -131,26 +161,6 @@ function applyDirectoryParams({ hb, sort }) {
   setTimeout(updateEmptyStateMessage, 0);
   setTimeout(updateEmptyStateMessage, 250);
   setTimeout(updateEmptyStateMessage, 900);
-}
-
-function ensureDefaultSortInUrl(url) {
-  const u = new URL(url || window.location.href, window.location.origin);
-  const sp = u.searchParams;
-
-  // If no explicit order yet, set default order=last_seen (desc)
-  if (!sp.get("order")) {
-    const next = buildUrlWithParams(
-      { hb: readHbParams(u.href), sort: { order: "last_seen", direction: "desc" } },
-      u.href
-    );
-
-    // routeTo only if it would change anything (avoid loops)
-    if (next !== (u.pathname + u.search)) {
-      DiscourseURL.routeTo(next);
-      return true;
-    }
-  }
-  return false;
 }
 
 function updateEmptyStateMessage() {
@@ -267,6 +277,11 @@ function injectFilters() {
   }
 
   fetchOptions().then((opt) => {
+    // Fail safe: if a future Discourse version changes the directory query
+    // integration, leave the native /u page untouched instead of showing
+    // controls that cannot safely filter its results.
+    if (opt.directory_integration_available === false) return;
+
     const listenValues = (opt.listen || []).filter((o) => o !== "No preference");
     const shareValues = (opt.share || []).filter((o) => o !== "No preference");
 
@@ -286,48 +301,28 @@ function injectFilters() {
           <div class="hb-user-search-field">
             <label for="hb-search-gender">Gender</label>
             <select name="gender" id="hb-search-gender">
-              ${genderOptions
-                .map(
-                  (option) =>
-                    `<option value="${option === "Do not consider" ? "" : option}">${option}</option>`
-                )
-                .join("")}
+              ${genderOptions.map(renderOption).join("")}
             </select>
           </div>
 
           <div class="hb-user-search-field">
             <label for="hb-search-country">Country</label>
             <select name="country" id="hb-search-country">
-              ${countryOptions
-                .map(
-                  (option) =>
-                    `<option value="${option === "Do not consider" ? "" : option}">${option}</option>`
-                )
-                .join("")}
+              ${countryOptions.map(renderOption).join("")}
             </select>
           </div>
 
           <div class="hb-user-search-field">
             <label for="hb-search-listen">Users who prefer to listen to</label>
             <select name="listen" id="hb-search-listen">
-              ${listenOptions
-                .map(
-                  (option) =>
-                    `<option value="${option === "Do not consider" ? "" : option}">${option}</option>`
-                )
-                .join("")}
+              ${listenOptions.map(renderOption).join("")}
             </select>
           </div>
 
           <div class="hb-user-search-field">
             <label for="hb-search-share">Users who prefer to share with</label>
             <select name="share" id="hb-search-share">
-              ${shareOptions
-                .map(
-                  (option) =>
-                    `<option value="${option === "Do not consider" ? "" : option}">${option}</option>`
-                )
-                .join("")}
+              ${shareOptions.map(renderOption).join("")}
             </select>
           </div>
         </div>
@@ -433,40 +428,55 @@ function injectFilters() {
 // ----------------------
 
 export default apiInitializer("0.11.1", (api) => {
-  // Make hb_* query params first-class for the /u route so changes trigger a
-  // model refresh (and thus a fresh /directory_items.json request).
+  // Add only our own query params. Core remains the owner of order/asc and
+  // every native directory parameter.
   api.modifyClass("route:users", {
     pluginId: "discourse-user-search-directory",
+
     init() {
       this._super(...arguments);
       this.queryParams = this.queryParams || {};
-      this.queryParams.hb_gender = { refreshModel: true };
-      this.queryParams.hb_country = { refreshModel: true };
-      this.queryParams.hb_listen = { refreshModel: true };
-      this.queryParams.hb_share = { refreshModel: true };
-      // Sorting params should also refresh the model
-      this.queryParams.order = { refreshModel: true };
-      this.queryParams.asc = { refreshModel: true };
+      HB_KEYS.forEach((key) => {
+        this.queryParams[key] = { refreshModel: true };
+      });
+    },
+
+    model(params) {
+      // Set the default before core performs its single directory load. This
+      // replaces the old post-load routeTo redirect/race.
+      params.order ||= "last_seen";
+      return this._super(params);
+    },
+
+    resetController(controller, isExiting) {
+      this._super(...arguments);
+      if (isExiting) {
+        controller.setProperties({
+          hb_gender: null,
+          hb_country: null,
+          hb_listen: null,
+          hb_share: null,
+        });
+      }
     },
   });
 
-  api.modifyClass("controller:users", {
-    pluginId: "discourse-user-search-directory",
-    hb_gender: null,
-    hb_country: null,
-    hb_listen: null,
-    hb_share: null,
-    order: null,
-    asc: null,
-  });
+  api.modifyClass(
+    "controller:users",
+    (Superclass) =>
+      class extends Superclass {
+        hb_gender = null;
+        hb_country = null;
+        hb_listen = null;
+        hb_share = null;
+      }
+  );
 
   api.onPageChange((url) => {
     const cleanUrl = (url || "").split("#")[0];
-    const isDirectory = /^\/u\/?(\?.*)?$/.test(cleanUrl) || /^\/users\/?(\?.*)?$/.test(cleanUrl);
+    const isDirectory =
+      /^\/u\/?(\?.*)?$/.test(cleanUrl) || /^\/users\/?(\?.*)?$/.test(cleanUrl);
     if (!isDirectory) return;
-
-    // Ensure default sorting is applied once (no hard refresh, just route change).
-    if (ensureDefaultSortInUrl(cleanUrl)) return;
 
     setTimeout(injectFilters, 0);
     setTimeout(updateEmptyStateMessage, 250);
