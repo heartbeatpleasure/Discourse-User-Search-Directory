@@ -442,8 +442,8 @@ export default apiInitializer("0.11.1", (api) => {
     },
 
     model(params) {
-      // Set the default before core performs its single directory load. This
-      // replaces the old post-load routeTo redirect/race.
+      // Set defaults before core performs its single directory load.
+      params.period ||= "all";
       params.order ||= "last_seen";
       return this._super(params);
     },
@@ -452,6 +452,7 @@ export default apiInitializer("0.11.1", (api) => {
       this._super(...arguments);
       if (isExiting) {
         controller.setProperties({
+          period: "all",
           hb_gender: null,
           hb_country: null,
           hb_listen: null,
@@ -465,6 +466,11 @@ export default apiInitializer("0.11.1", (api) => {
     "controller:users",
     (Superclass) =>
       class extends Superclass {
+        init() {
+          super.init(...arguments);
+          this.set("period", "all");
+        }
+
         hb_gender = null;
         hb_country = null;
         hb_listen = null;
